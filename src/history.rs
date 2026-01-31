@@ -55,8 +55,10 @@ pub struct Op<T> {
 pub enum OpValue<T> {
     /// A single element (for Add operations).
     Single(T),
-    /// A set of elements (for Read operations).
+    /// A set of elements (for Read operations, no duplicates).
     Set(HashSet<T>),
+    /// A list of elements (for Read operations, may have duplicates).
+    Vec(Vec<T>),
     /// No value (for Read invocations).
     None,
 }
@@ -72,6 +74,13 @@ impl<T> OpValue<T> {
     pub fn as_set(&self) -> Option<&HashSet<T>> {
         match self {
             OpValue::Set(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_vec(&self) -> Option<&Vec<T>> {
+        match self {
+            OpValue::Vec(v) => Some(v),
             _ => None,
         }
     }

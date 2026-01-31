@@ -52,6 +52,12 @@ pub struct ElementResult<T> {
     pub stable_latency_ms: Option<u64>,
     /// Latency in milliseconds until the element was lost (if lost).
     pub lost_latency_ms: Option<u64>,
+    /// Index and time when the element was first known to exist.
+    pub known_index: Option<usize>,
+    pub known_time: Option<u64>,
+    /// Index and time of the last read that didn't observe the element.
+    pub last_absent_index: Option<usize>,
+    pub last_absent_time: Option<u64>,
 }
 
 /// Validity status of the check.
@@ -60,6 +66,21 @@ pub enum Validity {
     Valid,
     Invalid,
     Unknown,
+}
+
+/// Detailed info about a stale element (for worst_stale reporting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorstStaleEntry<T> {
+    pub element: T,
+    pub outcome: ElementOutcome,
+    /// Index and time when the element was first known to exist.
+    pub known_index: usize,
+    pub known_time: Option<u64>,
+    /// Index and time of the last read that didn't observe the element.
+    pub last_absent_index: Option<usize>,
+    pub last_absent_time: Option<u64>,
+    /// Latency in milliseconds until stable.
+    pub stable_latency_ms: u64,
 }
 
 /// Result of the set-full check.
@@ -78,6 +99,8 @@ pub struct SetFullResult<T> {
     pub never_read: Vec<T>,
     /// Elements that were stale (non-zero stable latency).
     pub stale: Vec<T>,
+    /// Top 8 stale elements with highest latency, with detailed info.
+    pub worst_stale: Vec<WorstStaleEntry<T>>,
     /// Elements with duplicates and their max multiplicity.
     pub duplicated: BTreeMap<T, usize>,
     /// Latency percentiles for stable elements (0, 0.5, 0.95, 0.99, 1.0) in ms.
@@ -224,6 +247,10 @@ impl<T: Clone> ElementState<T> {
             outcome,
             stable_latency_ms,
             lost_latency_ms,
+            known_index: self.known.as_ref().map(|k| k.index),
+            known_time: self.known.as_ref().and_then(|k| k.time),
+            last_absent_index: self.last_absent.as_ref().map(|a| a.index),
+            last_absent_time: self.last_absent.as_ref().and_then(|a| a.time),
         }
     }
 }
@@ -248,8 +275,10 @@ impl SetFullChecker {
     where
         T: Clone + Eq + Hash + Ord,
     {
+        use ahash::HashSet;
+
         let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
-        let duplicates: BTreeMap<T, usize> = BTreeMap::new();
+        let mut duplicates: BTreeMap<T, usize> = BTreeMap::new();
 
         for op in history.ops() {
             match op.f {
@@ -274,24 +303,41 @@ impl SetFullChecker {
                 }
                 OpFn::Read => {
                     if op.op_type == OpType::Ok {
-                        if let OpValue::Set(ref read_set) = op.value {
-                            // Find the invocation for this read
-                            let inv = match history.invocation(op) {
-                                Some(i) => i,
-                                None => continue,
-                            };
+                        // Find the invocation for this read
+                        let inv = match history.invocation(op) {
+                            Some(i) => i,
+                            None => continue,
+                        };
 
-                            // Check for duplicates (would need to track multiplicities
-                            // in the actual read value - simplified here)
-                            // In a real implementation, we'd receive a Vec and count duplicates
-
-                            // Update all tracked elements
-                            for (elem, state) in elements.iter_mut() {
-                                if read_set.contains(elem) {
-                                    state.on_read_present(inv, op);
-                                } else {
-                                    state.on_read_absent(inv);
+                        // Handle both Set and Vec read values
+                        let read_set: HashSet<T> = match &op.value {
+                            OpValue::Set(s) => s.clone(),
+                            OpValue::Vec(v) => {
+                                // Detect duplicates: count frequencies
+                                let mut freqs: HashMap<T, usize> = HashMap::new();
+                                for elem in v {
+                                    *freqs.entry(elem.clone()).or_insert(0) += 1;
                                 }
+                                // Track max multiplicity for elements with count > 1
+                                for (elem, count) in &freqs {
+                                    if *count > 1 {
+                                        duplicates
+                                            .entry(elem.clone())
+                                            .and_modify(|c| *c = (*c).max(*count))
+                                            .or_insert(*count);
+                                    }
+                                }
+                                freqs.into_keys().collect()
+                            }
+                            _ => continue,
+                        };
+
+                        // Update all tracked elements
+                        for (elem, state) in elements.iter_mut() {
+                            if read_set.contains(elem) {
+                                state.on_read_present(inv, op);
+                            } else {
+                                state.on_read_absent(inv);
                             }
                         }
                     }
@@ -333,11 +379,34 @@ impl SetFullChecker {
         }
 
         // Stale elements: stable but with non-zero latency
-        let stale: Vec<T> = results
+        let mut stale_results: Vec<&ElementResult<T>> = results
             .iter()
             .filter(|r| r.outcome == ElementOutcome::Stable && r.stable_latency_ms.unwrap_or(0) > 0)
-            .map(|r| r.element.clone())
             .collect();
+
+        // Sort by stable_latency descending for worst_stale
+        stale_results.sort_by(|a, b| {
+            b.stable_latency_ms
+                .unwrap_or(0)
+                .cmp(&a.stable_latency_ms.unwrap_or(0))
+        });
+
+        // Top 8 worst stale elements
+        let worst_stale: Vec<WorstStaleEntry<T>> = stale_results
+            .iter()
+            .take(8)
+            .map(|r| WorstStaleEntry {
+                element: r.element.clone(),
+                outcome: r.outcome,
+                known_index: r.known_index.unwrap_or(0),
+                known_time: r.known_time,
+                last_absent_index: r.last_absent_index,
+                last_absent_time: r.last_absent_time,
+                stable_latency_ms: r.stable_latency_ms.unwrap_or(0),
+            })
+            .collect();
+
+        let stale: Vec<T> = stale_results.iter().map(|r| r.element.clone()).collect();
 
         // Determine validity
         let valid = if !lost.is_empty()
@@ -362,6 +431,7 @@ impl SetFullChecker {
             lost,
             never_read,
             stale,
+            worst_stale,
             duplicated: duplicates,
             stable_latencies: percentiles(&stable_latencies),
             lost_latencies: percentiles(&lost_latencies),
@@ -399,7 +469,7 @@ fn percentiles(values: &[u64]) -> Option<BTreeMap<String, u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::HashSet;
+    use ahash::{HashSet, HashSetExt};
 
     /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
     #[derive(Clone)]
@@ -658,5 +728,203 @@ mod tests {
         assert_eq!(result.stable_count, 1);
         assert_eq!(result.stale_count, 1);
         assert!(result.stale.contains(&1));
+
+        // Verify worst_stale contains element 1 with correct latency
+        assert_eq!(result.worst_stale.len(), 1);
+        let ws = &result.worst_stale[0];
+        assert_eq!(ws.element, 1);
+        assert_eq!(ws.outcome, ElementOutcome::Stable);
+        assert_eq!(ws.known_index, 4);
+        assert_eq!(ws.known_time, Some(4_000_000));
+        assert_eq!(ws.last_absent_index, Some(6));
+        assert_eq!(ws.last_absent_time, Some(6_000_000));
+        assert_eq!(ws.stable_latency_ms, 2); // (6_000_001 - 4_000_000) / 1_000_000 = 2
+
+        // Verify latency percentiles
+        let stable_lats = result.stable_latencies.as_ref().unwrap();
+        assert_eq!(stable_lats.get("0"), Some(&2));
+        assert_eq!(stable_lats.get("1"), Some(&2));
+
+        let lost_lats = result.lost_latencies.as_ref().unwrap();
+        // Element 0: known at 1, last_present at 6
+        // lost_latency = (6_000_001 - 1_000_000) / 1_000_000 = 5
+        assert_eq!(lost_lats.get("0"), Some(&5));
+        assert_eq!(lost_lats.get("1"), Some(&5));
+    }
+
+    #[test]
+    fn test_duplicates_in_read() {
+        // Read returns an element multiple times (duplicate)
+        let mut history = History::new();
+
+        // Add element 0
+        history.push(Op {
+            index: 0,
+            op_type: OpType::Invoke,
+            f: OpFn::Add,
+            value: OpValue::Single(0),
+            time: Some(0),
+            process: 0,
+        });
+        history.push(Op {
+            index: 1,
+            op_type: OpType::Ok,
+            f: OpFn::Add,
+            value: OpValue::Single(0),
+            time: Some(1_000_000),
+            process: 0,
+        });
+
+        // Read invoke
+        history.push(Op {
+            index: 2,
+            op_type: OpType::Invoke,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: Some(2_000_000),
+            process: 1,
+        });
+
+        // Read returns element 0 three times (duplicate!)
+        history.push(Op {
+            index: 3,
+            op_type: OpType::Ok,
+            f: OpFn::Read,
+            value: OpValue::Vec(vec![0, 0, 0]),
+            time: Some(3_000_000),
+            process: 1,
+        });
+
+        let checker = SetFullChecker::default();
+        let result = checker.check(&history);
+
+        // Should be invalid due to duplicates
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(result.duplicated_count, 1);
+        assert_eq!(result.duplicated.get(&0), Some(&3)); // max multiplicity is 3
+        assert_eq!(result.stable_count, 1); // element is still stable
+    }
+
+    #[test]
+    fn test_latencies_write_present_missing() {
+        // Verify latency values for the write_present_missing test
+        // [a0 a1 r2 r2'1 a0' a1' r2 r2'01 r2 r2'0 r2 r2']
+        let result = check(vec![
+            a0(),        // 0
+            a1(),        // 1
+            r2(),        // 2
+            r2_1(),      // 3: sees {1}
+            a0_ok(),     // 4
+            a1_ok(),     // 5
+            r2(),        // 6
+            r2_01(),     // 7: sees {0,1}
+            r2(),        // 8
+            r2_0(),      // 9: sees {0}
+            r2(),        // 10
+            r2_empty(),  // 11: sees {}
+        ]);
+
+        // Both elements are lost
+        assert_eq!(result.lost_count, 2);
+
+        // Verify lost_latencies
+        // Element 0: known at 4, last_present at 8 (invoke)
+        //   lost_latency = (8_000_001 - 4_000_000) / 1_000_000 = 4
+        // Element 1: known at 3 (first read that saw it), last_present at 6 (invoke)
+        //   lost_latency = (6_000_001 - 3_000_000) / 1_000_000 = 3
+        let lost_lats = result.lost_latencies.as_ref().unwrap();
+        // Percentiles: min=3, median=3 or 4, max=4
+        assert_eq!(lost_lats.get("0"), Some(&3)); // min
+        assert_eq!(lost_lats.get("1"), Some(&4)); // max
+    }
+
+    #[test]
+    fn test_worst_stale_ordering() {
+        // Create multiple stale elements with different latencies
+        // and verify worst_stale is ordered by latency descending
+
+        let mut history = History::new();
+
+        // Add elements 0, 1, 2
+        for elem in 0..3 {
+            history.push(Op {
+                index: elem * 2,
+                op_type: OpType::Invoke,
+                f: OpFn::Add,
+                value: OpValue::Single(elem as i32),
+                time: Some(elem as u64 * 2 * 1_000_000),
+                process: elem as u64,
+            });
+            history.push(Op {
+                index: elem * 2 + 1,
+                op_type: OpType::Ok,
+                f: OpFn::Add,
+                value: OpValue::Single(elem as i32),
+                time: Some((elem * 2 + 1) as u64 * 1_000_000),
+                process: elem as u64,
+            });
+        }
+        // Now: indices 0-5 are adds
+        // Element 0 known at index 1, time 1M
+        // Element 1 known at index 3, time 3M
+        // Element 2 known at index 5, time 5M
+
+        // Read that misses all (creating absent records at different times)
+        // Index 6: read invoke
+        history.push(Op {
+            index: 6,
+            op_type: OpType::Invoke,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: Some(6_000_000),
+            process: 10,
+        });
+        // Read returns empty - all elements absent
+        history.push(Op {
+            index: 7,
+            op_type: OpType::Ok,
+            f: OpFn::Read,
+            value: OpValue::Set(HashSet::new()),
+            time: Some(7_000_000),
+            process: 10,
+        });
+
+        // Read that sees all (making them stable)
+        history.push(Op {
+            index: 8,
+            op_type: OpType::Invoke,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: Some(8_000_000),
+            process: 10,
+        });
+        history.push(Op {
+            index: 9,
+            op_type: OpType::Ok,
+            f: OpFn::Read,
+            value: OpValue::Set(HashSet::from_iter([0, 1, 2])),
+            time: Some(9_000_000),
+            process: 10,
+        });
+
+        let checker = SetFullChecker::default();
+        let result = checker.check(&history);
+
+        // All elements are stable with different latencies
+        assert_eq!(result.stable_count, 3);
+        assert_eq!(result.stale_count, 3);
+        assert_eq!(result.worst_stale.len(), 3);
+
+        // Element 0: stable_latency = (6M+1 - 1M) / 1M = 5
+        // Element 1: stable_latency = (6M+1 - 3M) / 1M = 3
+        // Element 2: stable_latency = (6M+1 - 5M) / 1M = 1
+
+        // Verify ordering: worst (highest latency) first
+        assert_eq!(result.worst_stale[0].element, 0);
+        assert_eq!(result.worst_stale[0].stable_latency_ms, 5);
+        assert_eq!(result.worst_stale[1].element, 1);
+        assert_eq!(result.worst_stale[1].stable_latency_ms, 3);
+        assert_eq!(result.worst_stale[2].element, 2);
+        assert_eq!(result.worst_stale[2].stable_latency_ms, 1);
     }
 }
