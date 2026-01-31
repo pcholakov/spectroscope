@@ -399,115 +399,264 @@ fn percentiles(values: &[u64]) -> Option<BTreeMap<String, u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::{HashSet, HashSetExt};
+    use ahash::HashSet;
+
+    /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
+    #[derive(Clone)]
+    enum TestOp {
+        AddInvoke(u64, i32),       // (process, value)
+        AddOk(u64, i32),           // (process, value)
+        ReadInvoke(u64),           // (process)
+        ReadOk(u64, Vec<i32>),     // (process, values seen)
+    }
+
+    /// Build a history from a sequence of test ops.
+    /// Assigns indices sequentially and times as index * 1_000_000 (microseconds).
+    fn build_history(ops: Vec<TestOp>) -> History<i32> {
+        let mut history = History::new();
+        for (idx, test_op) in ops.into_iter().enumerate() {
+            let (op_type, f, value, process) = match test_op {
+                TestOp::AddInvoke(p, v) => (OpType::Invoke, OpFn::Add, OpValue::Single(v), p),
+                TestOp::AddOk(p, v) => (OpType::Ok, OpFn::Add, OpValue::Single(v), p),
+                TestOp::ReadInvoke(p) => (OpType::Invoke, OpFn::Read, OpValue::None, p),
+                TestOp::ReadOk(p, vals) => {
+                    (OpType::Ok, OpFn::Read, OpValue::Set(HashSet::from_iter(vals)), p)
+                }
+            };
+            history.push(Op {
+                index: idx,
+                op_type,
+                f,
+                value,
+                time: Some(idx as u64 * 1_000_000), // microseconds, like Jepsen
+                process,
+            });
+        }
+        history
+    }
+
+    fn check(ops: Vec<TestOp>) -> SetFullResult<i32> {
+        let history = build_history(ops);
+        SetFullChecker::default().check(&history)
+    }
+
+    // Helpers matching Jepsen's test setup
+    fn a() -> TestOp { TestOp::AddInvoke(0, 0) }
+    fn a_ok() -> TestOp { TestOp::AddOk(0, 0) }
+    fn r() -> TestOp { TestOp::ReadInvoke(1) }
+    fn r_plus() -> TestOp { TestOp::ReadOk(1, vec![0]) }
+    fn r_minus() -> TestOp { TestOp::ReadOk(1, vec![]) }
+
+    // Multi-element helpers
+    fn a0() -> TestOp { TestOp::AddInvoke(0, 0) }
+    fn a0_ok() -> TestOp { TestOp::AddOk(0, 0) }
+    fn a1() -> TestOp { TestOp::AddInvoke(1, 1) }
+    fn a1_ok() -> TestOp { TestOp::AddOk(1, 1) }
+    fn r2() -> TestOp { TestOp::ReadInvoke(2) }
+    fn r3() -> TestOp { TestOp::ReadInvoke(3) }
+    fn r2_empty() -> TestOp { TestOp::ReadOk(2, vec![]) }
+    fn r2_0() -> TestOp { TestOp::ReadOk(2, vec![0]) }
+    fn r2_1() -> TestOp { TestOp::ReadOk(2, vec![1]) }
+    fn r2_01() -> TestOp { TestOp::ReadOk(2, vec![0, 1]) }
+    fn r3_1() -> TestOp { TestOp::ReadOk(3, vec![1]) }
 
     #[test]
-    fn test_simple_add_read_stable() {
-        // Add 1, then read and see it
-        let mut history = History::new();
-        history.push(Op {
-            index: 0,
-            op_type: OpType::Invoke,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: Some(0),
-            process: 0,
-        });
-        history.push(Op {
-            index: 1,
-            op_type: OpType::Ok,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: Some(1_000_000_000),
-            process: 0,
-        });
-        history.push(Op {
-            index: 2,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(2_000_000_000),
-            process: 0,
-        });
-        history.push(Op {
-            index: 3,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Set(HashSet::from_iter([1])),
-            time: Some(3_000_000_000),
-            process: 0,
-        });
+    fn test_never_read() {
+        // Add element, but never read it
+        let result = check(vec![
+            TestOp::AddInvoke(0, 0),
+            TestOp::AddOk(0, 0),
+        ]);
 
-        let checker = SetFullChecker::linearizable();
-        let result = checker.check(&history);
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.attempt_count, 1);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+        assert_eq!(result.never_read, vec![0]);
+        assert_eq!(result.stable_count, 0);
+    }
+
+    #[test]
+    fn test_never_confirmed_never_read() {
+        // Add invoke only (no ok), concurrent absent read
+        // [a r r-]
+        let result = check(vec![a(), r(), r_minus()]);
+
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.attempt_count, 1);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+        assert_eq!(result.never_read, vec![0]);
+        assert_eq!(result.stable_count, 0);
+    }
+
+    #[test]
+    fn test_successful_read_concurrent_before() {
+        // [r a r+ a'] - Concurrent read before add
+        let result = check(vec![r(), a(), r_plus(), a_ok()]);
 
         assert_eq!(result.valid, Validity::Valid);
         assert_eq!(result.stable_count, 1);
         assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 0);
     }
 
     #[test]
-    fn test_lost_element() {
-        // Add 1, read and see it, then read and don't see it
-        let mut history = History::new();
-        // Add invoke
-        history.push(Op {
-            index: 0,
-            op_type: OpType::Invoke,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: Some(0),
-            process: 0,
-        });
-        // Add ok
-        history.push(Op {
-            index: 1,
-            op_type: OpType::Ok,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: Some(1_000_000_000),
-            process: 0,
-        });
-        // Read invoke (sees it)
-        history.push(Op {
-            index: 2,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(2_000_000_000),
-            process: 0,
-        });
-        history.push(Op {
-            index: 3,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Set(HashSet::from_iter([1])),
-            time: Some(3_000_000_000),
-            process: 0,
-        });
-        // Read invoke (doesn't see it - lost!)
-        history.push(Op {
-            index: 4,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(4_000_000_000),
-            process: 0,
-        });
-        history.push(Op {
-            index: 5,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Set(HashSet::new()),
-            time: Some(5_000_000_000),
-            process: 0,
-        });
+    fn test_successful_read_concurrent_outside() {
+        // [r a a' r+] - Concurrent read outside add
+        let result = check(vec![r(), a(), a_ok(), r_plus()]);
 
-        let checker = SetFullChecker::new(SetFullOptions::default());
-        let result = checker.check(&history);
+        assert_eq!(result.valid, Validity::Valid);
+        assert_eq!(result.stable_count, 1);
+    }
+
+    #[test]
+    fn test_successful_read_concurrent_inside() {
+        // [a r r+ a'] - Concurrent read inside add
+        let result = check(vec![a(), r(), r_plus(), a_ok()]);
+
+        assert_eq!(result.valid, Validity::Valid);
+        assert_eq!(result.stable_count, 1);
+    }
+
+    #[test]
+    fn test_successful_read_concurrent_after() {
+        // [a r a' r+] - Concurrent read after add invoke
+        let result = check(vec![a(), r(), a_ok(), r_plus()]);
+
+        assert_eq!(result.valid, Validity::Valid);
+        assert_eq!(result.stable_count, 1);
+    }
+
+    #[test]
+    fn test_successful_read_subsequent() {
+        // [a a' r r+] - Subsequent read
+        let result = check(vec![a(), a_ok(), r(), r_plus()]);
+
+        assert_eq!(result.valid, Validity::Valid);
+        assert_eq!(result.stable_count, 1);
+        assert_eq!(result.stale_count, 0);
+    }
+
+    #[test]
+    fn test_absent_read_after() {
+        // [a a' r r-] - Add completes, then absent read -> lost
+        let result = check(vec![a(), a_ok(), r(), r_minus()]);
 
         assert_eq!(result.valid, Validity::Invalid);
         assert_eq!(result.lost_count, 1);
+        assert_eq!(result.lost, vec![0]);
+        assert_eq!(result.stable_count, 0);
+    }
+
+    #[test]
+    fn test_absent_read_concurrent_before() {
+        // [r a r- a'] - Read before add, absent -> unknown (not lost)
+        let result = check(vec![r(), a(), r_minus(), a_ok()]);
+
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+    }
+
+    #[test]
+    fn test_absent_read_concurrent_outside() {
+        // [r a a' r-] - Read outside add, absent -> unknown
+        let result = check(vec![r(), a(), a_ok(), r_minus()]);
+
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+    }
+
+    #[test]
+    fn test_absent_read_concurrent_inside() {
+        // [a r r- a'] - Read inside add, absent -> unknown
+        let result = check(vec![a(), r(), r_minus(), a_ok()]);
+
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+    }
+
+    #[test]
+    fn test_absent_read_concurrent_after_invoke() {
+        // [a r a' r-] - Read after add invoke, absent -> unknown
+        let result = check(vec![a(), r(), a_ok(), r_minus()]);
+
+        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.lost_count, 0);
+        assert_eq!(result.never_read_count, 1);
+    }
+
+    #[test]
+    fn test_write_present_missing() {
+        // Complex multi-element test:
+        // We write a0 and a1 concurrently, reading 1 before a1 completes.
+        // Then we read both, 0, then nothing.
+        // [a0 a1 r2 r2'1 a0' a1' r2 r2'01 r2 r2'0 r2 r2']
+        let result = check(vec![
+            a0(),        // 0
+            a1(),        // 1
+            r2(),        // 2
+            r2_1(),      // 3: sees {1}
+            a0_ok(),     // 4
+            a1_ok(),     // 5
+            r2(),        // 6
+            r2_01(),     // 7: sees {0,1}
+            r2(),        // 8
+            r2_0(),      // 9: sees {0}
+            r2(),        // 10
+            r2_empty(),  // 11: sees {}
+        ]);
+
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(result.attempt_count, 2);
+        assert_eq!(result.lost_count, 2);
+        assert!(result.lost.contains(&0));
         assert!(result.lost.contains(&1));
+        assert_eq!(result.stable_count, 0);
+    }
+
+    #[test]
+    fn test_write_flutter_stable_lost() {
+        // Element 1 flutters (present -> absent -> present), element 0 is lost.
+        // t:   0  1    2   3  4     5     6  7   8     9
+        // ops: a0 a0'  a1  r2 r2'1  a1'   r2 r3  r3'1  r2'0
+        let result = check(vec![
+            a0(),        // 0: add 0 invoke
+            a0_ok(),     // 1: add 0 ok
+            a1(),        // 2: add 1 invoke
+            r2(),        // 3: read invoke (process 2)
+            r2_1(),      // 4: read ok, sees {1}
+            a1_ok(),     // 5: add 1 ok
+            r2(),        // 6: read invoke (process 2)
+            r3(),        // 7: read invoke (process 3)
+            r3_1(),      // 8: read ok (process 3), sees {1}
+            r2_0(),      // 9: read ok (process 2), sees {0}
+        ]);
+
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(result.attempt_count, 2);
+
+        // Element 0 is lost: known at 1, last present at 9 (invoke 6), but last absent at 7
+        // Wait, let me trace this:
+        // Element 0: known at index 1 (a0_ok)
+        //   r2 at index 3 -> r2_1 at 4 (doesn't contain 0) -> last_absent = 3
+        //   r2 at index 6 -> r2_0 at 9 (contains 0) -> last_present = 6
+        //   r3 at index 7 -> r3_1 at 8 (doesn't contain 0) -> last_absent = 7
+        // So last_present (6) < last_absent (7), and last_absent (7) > known (1) -> LOST
+        assert_eq!(result.lost_count, 1);
+        assert!(result.lost.contains(&0));
+
+        // Element 1 is stable but stale: known at index 4 (r2_1 saw it before a1_ok)
+        //   r2 at 3 -> r2_1 at 4 (contains 1) -> last_present = 3
+        //   r2 at 6 -> r2_0 at 9 (doesn't contain 1) -> last_absent = 6
+        //   r3 at 7 -> r3_1 at 8 (contains 1) -> last_present = 7
+        // So last_present (7) > last_absent (6) -> STABLE
+        // Stale latency: last_absent.time + 1 - known.time = 6000001 - 4000000 = 2000001 ns = 2 ms
+        assert_eq!(result.stable_count, 1);
+        assert_eq!(result.stale_count, 1);
+        assert!(result.stale.contains(&1));
     }
 }
