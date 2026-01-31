@@ -18,8 +18,8 @@
 //!
 //! Derived from Jepsen's set-full checker, licensed under EPL-1.0.
 
-use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt};
 
@@ -54,10 +54,10 @@ pub struct ElementResult<T> {
     pub lost_latency_ms: Option<u64>,
     /// Index and time when the element was first known to exist.
     pub known_index: Option<usize>,
-    pub known_time: Option<u64>,
+    pub known_time: Option<Duration>,
     /// Index and time of the last read that didn't observe the element.
     pub last_absent_index: Option<usize>,
-    pub last_absent_time: Option<u64>,
+    pub last_absent_time: Option<Duration>,
 }
 
 /// Validity status of the check.
@@ -75,10 +75,10 @@ pub struct WorstStaleEntry<T> {
     pub outcome: ElementOutcome,
     /// Index and time when the element was first known to exist.
     pub known_index: usize,
-    pub known_time: Option<u64>,
+    pub known_time: Option<Duration>,
     /// Index and time of the last read that didn't observe the element.
     pub last_absent_index: Option<usize>,
-    pub last_absent_time: Option<u64>,
+    pub last_absent_time: Option<Duration>,
     /// Latency in milliseconds until stable.
     pub stable_latency_ms: u64,
 }
@@ -102,11 +102,33 @@ pub struct SetFullResult<T> {
     /// Top 8 stale elements with highest latency, with detailed info.
     pub worst_stale: Vec<WorstStaleEntry<T>>,
     /// Elements with duplicates and their max multiplicity.
-    pub duplicated: BTreeMap<T, usize>,
-    /// Latency percentiles for stable elements (0, 0.5, 0.95, 0.99, 1.0) in ms.
-    pub stable_latencies: Option<BTreeMap<String, u64>>,
-    /// Latency percentiles for lost elements in ms.
-    pub lost_latencies: Option<BTreeMap<String, u64>>,
+    pub duplicated: HashMap<T, usize>,
+    /// Raw stable latencies in milliseconds (unsorted).
+    stable_latencies: Vec<u64>,
+    /// Raw lost latencies in milliseconds (unsorted).
+    lost_latencies: Vec<u64>,
+}
+
+impl<T> SetFullResult<T> {
+    /// Compute a percentile (0.0 to 1.0) from stable latencies. Returns None if no stable elements.
+    pub fn stable_latency_percentile(&self, p: f64) -> Option<u64> {
+        percentile(&self.stable_latencies, p)
+    }
+
+    /// Compute a percentile (0.0 to 1.0) from lost latencies. Returns None if no lost elements.
+    pub fn lost_latency_percentile(&self, p: f64) -> Option<u64> {
+        percentile(&self.lost_latencies, p)
+    }
+
+    /// Get all stable latencies (unsorted).
+    pub fn stable_latencies(&self) -> &[u64] {
+        &self.stable_latencies
+    }
+
+    /// Get all lost latencies (unsorted).
+    pub fn lost_latencies(&self) -> &[u64] {
+        &self.lost_latencies
+    }
 }
 
 /// Tracks the state of a single element during analysis.
@@ -125,7 +147,7 @@ struct ElementState<T> {
 #[derive(Debug, Clone)]
 struct OpRef {
     index: usize,
-    time: Option<u64>,
+    time: Option<Duration>,
 }
 
 impl<T: Clone> ElementState<T> {
@@ -216,12 +238,12 @@ impl<T: Clone> ElementState<T> {
 
         let stable_latency_ms = if stable {
             let stable_time = if let Some(ref la) = self.last_absent {
-                la.time.map(|t| t + 1)
+                la.time.map(|t| t + Duration::from_nanos(1))
             } else {
-                Some(0)
+                Some(Duration::ZERO)
             };
             match (stable_time, known_time) {
-                (Some(st), Some(kt)) => Some(st.saturating_sub(kt) / 1_000_000),
+                (Some(st), Some(kt)) => Some(st.saturating_sub(kt).as_millis() as u64),
                 _ => Some(0),
             }
         } else {
@@ -230,12 +252,12 @@ impl<T: Clone> ElementState<T> {
 
         let lost_latency_ms = if lost {
             let lost_time = if let Some(ref lp) = self.last_present {
-                lp.time.map(|t| t + 1)
+                lp.time.map(|t| t + Duration::from_nanos(1))
             } else {
-                Some(0)
+                Some(Duration::ZERO)
             };
             match (lost_time, known_time) {
-                (Some(lt), Some(kt)) => Some(lt.saturating_sub(kt) / 1_000_000),
+                (Some(lt), Some(kt)) => Some(lt.saturating_sub(kt).as_millis() as u64),
                 _ => Some(0),
             }
         } else {
@@ -278,7 +300,7 @@ impl SetFullChecker {
         use ahash::HashSet;
 
         let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
-        let mut duplicates: BTreeMap<T, usize> = BTreeMap::new();
+        let mut duplicates: HashMap<T, usize> = HashMap::new();
 
         for op in history.ops() {
             match op.f {
@@ -433,43 +455,29 @@ impl SetFullChecker {
             stale,
             worst_stale,
             duplicated: duplicates,
-            stable_latencies: percentiles(&stable_latencies),
-            lost_latencies: percentiles(&lost_latencies),
+            stable_latencies,
+            lost_latencies,
         }
     }
 }
 
-/// Compute percentile distribution.
-fn percentiles(values: &[u64]) -> Option<BTreeMap<String, u64>> {
+/// Compute a percentile from a slice of values.
+fn percentile(values: &[u64], p: f64) -> Option<u64> {
     if values.is_empty() {
         return None;
     }
-
     let mut sorted: Vec<u64> = values.to_vec();
     sorted.sort_unstable();
-
-    let n = sorted.len();
-    let points = [
-        (0.0, "0"),
-        (0.5, "0.5"),
-        (0.95, "0.95"),
-        (0.99, "0.99"),
-        (1.0, "1"),
-    ];
-
-    let mut result = BTreeMap::new();
-    for (p, label) in points {
-        let idx = ((n as f64 * p).floor() as usize).min(n - 1);
-        result.insert(label.to_string(), sorted[idx]);
-    }
-
-    Some(result)
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    Some(sorted[idx])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ahash::{HashSet, HashSetExt};
+    use std::time::Duration;
+    use crate::history::ProcessId;
 
     /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
     #[derive(Clone)]
@@ -498,8 +506,8 @@ mod tests {
                 op_type,
                 f,
                 value,
-                time: Some(idx as u64 * 1_000_000), // microseconds, like Jepsen
-                process,
+                time: Some(Duration::from_nanos(idx as u64 * 1_000_000)), // microseconds, like Jepsen
+                process: ProcessId::from(process),
             });
         }
         history
@@ -735,21 +743,19 @@ mod tests {
         assert_eq!(ws.element, 1);
         assert_eq!(ws.outcome, ElementOutcome::Stable);
         assert_eq!(ws.known_index, 4);
-        assert_eq!(ws.known_time, Some(4_000_000));
+        assert_eq!(ws.known_time, Some(Duration::from_nanos(4_000_000)));
         assert_eq!(ws.last_absent_index, Some(6));
-        assert_eq!(ws.last_absent_time, Some(6_000_000));
+        assert_eq!(ws.last_absent_time, Some(Duration::from_nanos(6_000_000)));
         assert_eq!(ws.stable_latency_ms, 2); // (6_000_001 - 4_000_000) / 1_000_000 = 2
 
-        // Verify latency percentiles
-        let stable_lats = result.stable_latencies.as_ref().unwrap();
-        assert_eq!(stable_lats.get("0"), Some(&2));
-        assert_eq!(stable_lats.get("1"), Some(&2));
+        // Verify latency percentiles (only one stable element, so min=max=2)
+        assert_eq!(result.stable_latency_percentile(0.0), Some(2));
+        assert_eq!(result.stable_latency_percentile(1.0), Some(2));
 
-        let lost_lats = result.lost_latencies.as_ref().unwrap();
         // Element 0: known at 1, last_present at 6
         // lost_latency = (6_000_001 - 1_000_000) / 1_000_000 = 5
-        assert_eq!(lost_lats.get("0"), Some(&5));
-        assert_eq!(lost_lats.get("1"), Some(&5));
+        assert_eq!(result.lost_latency_percentile(0.0), Some(5));
+        assert_eq!(result.lost_latency_percentile(1.0), Some(5));
     }
 
     #[test]
@@ -763,16 +769,16 @@ mod tests {
             op_type: OpType::Invoke,
             f: OpFn::Add,
             value: OpValue::Single(0),
-            time: Some(0),
-            process: 0,
+            time: Some(Duration::ZERO),
+            process: ProcessId(0),
         });
         history.push(Op {
             index: 1,
             op_type: OpType::Ok,
             f: OpFn::Add,
             value: OpValue::Single(0),
-            time: Some(1_000_000),
-            process: 0,
+            time: Some(Duration::from_nanos(1_000_000)),
+            process: ProcessId(0),
         });
 
         // Read invoke
@@ -781,8 +787,8 @@ mod tests {
             op_type: OpType::Invoke,
             f: OpFn::Read,
             value: OpValue::None,
-            time: Some(2_000_000),
-            process: 1,
+            time: Some(Duration::from_nanos(2_000_000)),
+            process: ProcessId(1),
         });
 
         // Read returns element 0 three times (duplicate!)
@@ -791,8 +797,8 @@ mod tests {
             op_type: OpType::Ok,
             f: OpFn::Read,
             value: OpValue::Vec(vec![0, 0, 0]),
-            time: Some(3_000_000),
-            process: 1,
+            time: Some(Duration::from_nanos(3_000_000)),
+            process: ProcessId(1),
         });
 
         let checker = SetFullChecker::default();
@@ -832,10 +838,9 @@ mod tests {
         //   lost_latency = (8_000_001 - 4_000_000) / 1_000_000 = 4
         // Element 1: known at 3 (first read that saw it), last_present at 6 (invoke)
         //   lost_latency = (6_000_001 - 3_000_000) / 1_000_000 = 3
-        let lost_lats = result.lost_latencies.as_ref().unwrap();
-        // Percentiles: min=3, median=3 or 4, max=4
-        assert_eq!(lost_lats.get("0"), Some(&3)); // min
-        assert_eq!(lost_lats.get("1"), Some(&4)); // max
+        // Percentiles: min=3, max=4
+        assert_eq!(result.lost_latency_percentile(0.0), Some(3)); // min
+        assert_eq!(result.lost_latency_percentile(1.0), Some(4)); // max
     }
 
     #[test]
@@ -852,16 +857,16 @@ mod tests {
                 op_type: OpType::Invoke,
                 f: OpFn::Add,
                 value: OpValue::Single(elem as i32),
-                time: Some(elem as u64 * 2 * 1_000_000),
-                process: elem as u64,
+                time: Some(Duration::from_nanos(elem as u64 * 2 * 1_000_000)),
+                process: ProcessId(elem as u64),
             });
             history.push(Op {
                 index: elem * 2 + 1,
                 op_type: OpType::Ok,
                 f: OpFn::Add,
                 value: OpValue::Single(elem as i32),
-                time: Some((elem * 2 + 1) as u64 * 1_000_000),
-                process: elem as u64,
+                time: Some(Duration::from_nanos((elem * 2 + 1) as u64 * 1_000_000)),
+                process: ProcessId(elem as u64),
             });
         }
         // Now: indices 0-5 are adds
@@ -876,8 +881,8 @@ mod tests {
             op_type: OpType::Invoke,
             f: OpFn::Read,
             value: OpValue::None,
-            time: Some(6_000_000),
-            process: 10,
+            time: Some(Duration::from_nanos(6_000_000)),
+            process: ProcessId(10),
         });
         // Read returns empty - all elements absent
         history.push(Op {
@@ -885,8 +890,8 @@ mod tests {
             op_type: OpType::Ok,
             f: OpFn::Read,
             value: OpValue::Set(HashSet::new()),
-            time: Some(7_000_000),
-            process: 10,
+            time: Some(Duration::from_nanos(7_000_000)),
+            process: ProcessId(10),
         });
 
         // Read that sees all (making them stable)
@@ -895,16 +900,16 @@ mod tests {
             op_type: OpType::Invoke,
             f: OpFn::Read,
             value: OpValue::None,
-            time: Some(8_000_000),
-            process: 10,
+            time: Some(Duration::from_nanos(8_000_000)),
+            process: ProcessId(10),
         });
         history.push(Op {
             index: 9,
             op_type: OpType::Ok,
             f: OpFn::Read,
             value: OpValue::Set(HashSet::from_iter([0, 1, 2])),
-            time: Some(9_000_000),
-            process: 10,
+            time: Some(Duration::from_nanos(9_000_000)),
+            process: ProcessId(10),
         });
 
         let checker = SetFullChecker::default();

@@ -8,6 +8,17 @@
 
 use ahash::HashSet;
 use std::hash::Hash;
+use std::time::Duration;
+
+/// Process/thread identifier (newtype for type safety).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ProcessId(pub u64);
+
+impl From<u64> for ProcessId {
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
 
 /// The type/phase of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,10 +55,10 @@ pub struct Op<T> {
     /// For Add: the element being added.
     /// For Read: None on invoke, Some(set contents) on completion.
     pub value: OpValue<T>,
-    /// Timestamp in nanoseconds (optional, used for latency calculations).
-    pub time: Option<u64>,
+    /// Timestamp (optional, used for latency calculations).
+    pub time: Option<Duration>,
     /// Process/thread that performed this operation.
-    pub process: u64,
+    pub process: ProcessId,
 }
 
 /// Value associated with an operation.
