@@ -1,0 +1,14 @@
+[package]
+name = "spectra"
+version = "0.1.0"
+edition = "2024"
+license = "EPL-1.0"
+description = "Consistency and isolation level checkers for distributed systems testing"
+repository = "https://github.com/pcholakov/spectra"
+keywords = ["distributed-systems", "testing", "linearizability", "consistency"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+ahash = "0.8"
+
+[dev-dependencies]
