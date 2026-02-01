@@ -297,12 +297,12 @@ impl SetFullChecker {
     where
         T: Clone + Eq + Hash + Ord,
     {
-        use ahash::HashSet;
+        use std::collections::HashSet;
 
         let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
         let mut duplicates: HashMap<T, usize> = HashMap::new();
 
-        for op in history.ops() {
+        for (pos, op) in history.ops().iter().enumerate() {
             match op.f {
                 OpFn::Add => {
                     if let OpValue::Single(ref v) = op.value {
@@ -314,10 +314,11 @@ impl SetFullChecker {
                                     .or_insert_with(|| ElementState::new(v.clone()));
                             }
                             OpType::Ok => {
-                                // Mark as known
-                                if let Some(state) = elements.get_mut(v) {
-                                    state.on_add_ok(op);
-                                }
+                                // Mark as known (create if missing - handles add_ok without invoke)
+                                elements
+                                    .entry(v.clone())
+                                    .or_insert_with(|| ElementState::new(v.clone()))
+                                    .on_add_ok(op);
                             }
                             _ => {}
                         }
@@ -325,15 +326,15 @@ impl SetFullChecker {
                 }
                 OpFn::Read => {
                     if op.op_type == OpType::Ok {
-                        // Find the invocation for this read
-                        let inv = match history.invocation(op) {
+                        // Find the invocation for this read using position in history
+                        let inv = match history.invocation(pos) {
                             Some(i) => i,
                             None => continue,
                         };
 
                         // Handle both Set and Vec read values
                         let read_set: HashSet<T> = match &op.value {
-                            OpValue::Set(s) => s.clone(),
+                            OpValue::Set(s) => s.iter().cloned().collect(),
                             OpValue::Vec(v) => {
                                 // Detect duplicates: count frequencies
                                 let mut freqs: HashMap<T, usize> = HashMap::new();
@@ -353,6 +354,20 @@ impl SetFullChecker {
                             }
                             _ => continue,
                         };
+
+                        // Track elements discovered in reads (not previously added)
+                        for elem in &read_set {
+                            if !elements.contains_key(elem) {
+                                let mut state = ElementState::new(elem.clone());
+                                // Element is known from this read
+                                state.known = Some(OpRef {
+                                    index: op.index,
+                                    time: op.time,
+                                });
+                                state.on_read_present(inv, op);
+                                elements.insert(elem.clone(), state);
+                            }
+                        }
 
                         // Update all tracked elements
                         for (elem, state) in elements.iter_mut() {
@@ -475,7 +490,7 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::HashSet;
+    use std::collections::HashSet;
     use std::time::Duration;
     use crate::history::ProcessId;
 
@@ -849,5 +864,85 @@ mod tests {
         assert_eq!(result.worst_stale[1].stable_latency_ms, 3);
         assert_eq!(result.worst_stale[2].element, 2);
         assert_eq!(result.worst_stale[2].stable_latency_ms, 1);
+    }
+
+    #[test]
+    fn test_element_discovered_in_read() {
+        // Element appears in a read without any prior add operation.
+        // This can happen if the history is incomplete or if element was added
+        // by a process not in the history.
+        let mut history = History::new();
+
+        // Read sees element 42, but there's no add for it
+        history.push(Op::read_invoke(0, 0u64).at(Duration::from_millis(0)));
+        history.push(Op::read_ok(1, 0u64, [42]).at(Duration::from_millis(1)));
+
+        // Second read also sees it
+        history.push(Op::read_invoke(2, 0u64).at(Duration::from_millis(2)));
+        history.push(Op::read_ok(3, 0u64, [42]).at(Duration::from_millis(3)));
+
+        let result = SetFullChecker::default().check(&history);
+
+        // Element should be tracked and stable (seen in both reads)
+        assert_eq!(result.attempt_count, 1);
+        assert_eq!(result.stable_count, 1);
+        assert_eq!(result.valid, Validity::Valid);
+    }
+
+    #[test]
+    fn test_element_discovered_in_read_then_lost() {
+        // Element appears in read, then disappears - should be lost
+        let mut history = History::new();
+
+        history.push(Op::read_invoke(0, 0u64).at(Duration::from_millis(0)));
+        history.push(Op::read_ok(1, 0u64, [42]).at(Duration::from_millis(1)));
+
+        history.push(Op::read_invoke(2, 0u64).at(Duration::from_millis(2)));
+        history.push(Op::read_ok(3, 0u64, []).at(Duration::from_millis(3)));
+
+        let result = SetFullChecker::default().check(&history);
+
+        assert_eq!(result.attempt_count, 1);
+        assert_eq!(result.lost_count, 1);
+        assert!(result.lost.contains(&42));
+        assert_eq!(result.valid, Validity::Invalid);
+    }
+
+    #[test]
+    fn test_add_ok_without_invoke() {
+        // add_ok appears without a prior add_invoke - should still track element
+        let mut history = History::new();
+
+        // Only the completion, no invoke
+        history.push(Op::add_ok(0, 0u64, 99).at(Duration::from_millis(0)));
+
+        // Read sees the element
+        history.push(Op::read_invoke(1, 1u64).at(Duration::from_millis(1)));
+        history.push(Op::read_ok(2, 1u64, [99]).at(Duration::from_millis(2)));
+
+        let result = SetFullChecker::default().check(&history);
+
+        assert_eq!(result.attempt_count, 1);
+        assert_eq!(result.stable_count, 1);
+        assert_eq!(result.valid, Validity::Valid);
+    }
+
+    #[test]
+    fn test_invocation_matches_correct_op_fn() {
+        // Verify that read_ok matches read_invoke, not add_invoke from same process
+        let mut history = History::new();
+
+        // Process 0: add invoke, then read invoke, then read ok
+        // The read_ok should match the read_invoke, not the add_invoke
+        history.push(Op::add_invoke(0, 0u64, 1).at(Duration::from_millis(0)));
+        history.push(Op::read_invoke(1, 0u64).at(Duration::from_millis(1)));
+        history.push(Op::read_ok(2, 0u64, [1]).at(Duration::from_millis(2)));
+        history.push(Op::add_ok(3, 0u64, 1).at(Duration::from_millis(3)));
+
+        let result = SetFullChecker::default().check(&history);
+
+        // Should work correctly - element is stable
+        assert_eq!(result.stable_count, 1);
+        assert_eq!(result.valid, Validity::Valid);
     }
 }

@@ -6,8 +6,7 @@
 //! - `Fail` marks a definite failure
 //! - `Info` marks an indeterminate result (crash, timeout, etc.)
 
-use ahash::HashSet;
-use std::hash::Hash;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Process/thread identifier (newtype for type safety).
@@ -154,12 +153,12 @@ impl<T> OpValue<T> {
 }
 
 /// A history of operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct History<T> {
     ops: Vec<Op<T>>,
 }
 
-impl<T: Clone + Eq + Hash> History<T> {
+impl<T> History<T> {
     pub fn new() -> Self {
         Self { ops: Vec::new() }
     }
@@ -176,18 +175,29 @@ impl<T: Clone + Eq + Hash> History<T> {
         &self.ops
     }
 
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
     /// Find the invocation operation for a given completion operation.
-    /// Searches backward for a matching Invoke from the same process.
-    pub fn invocation(&self, completion: &Op<T>) -> Option<&Op<T>> {
-        self.ops[..completion.index]
+    /// Searches backward from the completion's position for a matching Invoke
+    /// from the same process with the same operation function.
+    pub fn invocation(&self, completion_pos: usize) -> Option<&Op<T>> {
+        if completion_pos == 0 || completion_pos > self.ops.len() {
+            return None;
+        }
+        let completion = &self.ops[completion_pos];
+        self.ops[..completion_pos]
             .iter()
             .rev()
-            .find(|op| op.process == completion.process && op.op_type == OpType::Invoke)
-    }
-}
-
-impl<T: Clone + Eq + Hash> Default for History<T> {
-    fn default() -> Self {
-        Self::new()
+            .find(|op| {
+                op.process == completion.process
+                    && op.op_type == OpType::Invoke
+                    && op.f == completion.f
+            })
     }
 }
