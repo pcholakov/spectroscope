@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// Process/thread identifier (newtype for type safety).
+/// Process or thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct ProcessId(pub u64);
 
@@ -110,6 +110,7 @@ impl<T> Op<T> {
     }
 
     /// Set the timestamp for this operation.
+    #[must_use]
     pub fn at(mut self, time: Duration) -> Self {
         self.time = Some(time);
         self
@@ -159,10 +160,12 @@ pub struct History<T> {
 }
 
 impl<T> History<T> {
+    #[must_use]
     pub fn new() -> Self {
         Self { ops: Vec::new() }
     }
 
+    #[must_use]
     pub fn from_ops(ops: Vec<Op<T>>) -> Self {
         Self { ops }
     }
@@ -171,21 +174,23 @@ impl<T> History<T> {
         self.ops.push(op);
     }
 
+    #[must_use]
     pub fn ops(&self) -> &[Op<T>] {
         &self.ops
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
-    /// Find the invocation operation for a given completion operation.
-    /// Searches backward from the completion's position for a matching Invoke
-    /// from the same process with the same operation function.
+    /// Find the invocation for a given completion by searching backward.
+    #[must_use]
     pub fn invocation(&self, completion_pos: usize) -> Option<&Op<T>> {
         if completion_pos == 0 || completion_pos > self.ops.len() {
             return None;

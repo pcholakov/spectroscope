@@ -15,3 +15,5 @@ categories = ["development-tools::testing"]
 ahash = "0.8"
 
 [dev-dependencies]
+proptest = "1.5"
+rand = "0.9"
