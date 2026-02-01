@@ -98,7 +98,11 @@ impl<T> Op<T> {
     }
 
     /// Create a read completion with observed values.
-    pub fn read_ok(index: usize, process: impl Into<ProcessId>, values: impl IntoIterator<Item = T>) -> Self {
+    pub fn read_ok(
+        index: usize,
+        process: impl Into<ProcessId>,
+        values: impl IntoIterator<Item = T>,
+    ) -> Self {
         Self {
             index,
             op_type: OpType::Ok,
@@ -196,13 +200,8 @@ impl<T> History<T> {
             return None;
         }
         let completion = &self.ops[completion_pos];
-        self.ops[..completion_pos]
-            .iter()
-            .rev()
-            .find(|op| {
-                op.process == completion.process
-                    && op.op_type == OpType::Invoke
-                    && op.f == completion.f
-            })
+        self.ops[..completion_pos].iter().rev().find(|op| {
+            op.process == completion.process && op.op_type == OpType::Invoke && op.f == completion.f
+        })
     }
 }

@@ -143,7 +143,6 @@ struct ElementState<T> {
     last_absent: Option<OpRef>,
 }
 
-
 #[derive(Debug, Clone)]
 struct OpRef {
     index: usize,
@@ -493,17 +492,17 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::ProcessId;
     use std::collections::HashSet;
     use std::time::Duration;
-    use crate::history::ProcessId;
 
     /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
     #[derive(Clone)]
     enum TestOp {
-        AddInvoke(u64, i32),       // (process, value)
-        AddOk(u64, i32),           // (process, value)
-        ReadInvoke(u64),           // (process)
-        ReadOk(u64, Vec<i32>),     // (process, values seen)
+        AddInvoke(u64, i32),   // (process, value)
+        AddOk(u64, i32),       // (process, value)
+        ReadInvoke(u64),       // (process)
+        ReadOk(u64, Vec<i32>), // (process, values seen)
     }
 
     /// Build a history from a sequence of test ops.
@@ -515,9 +514,12 @@ mod tests {
                 TestOp::AddInvoke(p, v) => (OpType::Invoke, OpFn::Add, OpValue::Single(v), p),
                 TestOp::AddOk(p, v) => (OpType::Ok, OpFn::Add, OpValue::Single(v), p),
                 TestOp::ReadInvoke(p) => (OpType::Invoke, OpFn::Read, OpValue::None, p),
-                TestOp::ReadOk(p, vals) => {
-                    (OpType::Ok, OpFn::Read, OpValue::Set(HashSet::from_iter(vals)), p)
-                }
+                TestOp::ReadOk(p, vals) => (
+                    OpType::Ok,
+                    OpFn::Read,
+                    OpValue::Set(HashSet::from_iter(vals)),
+                    p,
+                ),
             };
             history.push(Op {
                 index: idx,
@@ -537,24 +539,56 @@ mod tests {
     }
 
     // Helpers matching Jepsen's test setup
-    fn a() -> TestOp { TestOp::AddInvoke(0, 0) }
-    fn a_ok() -> TestOp { TestOp::AddOk(0, 0) }
-    fn r() -> TestOp { TestOp::ReadInvoke(1) }
-    fn r_plus() -> TestOp { TestOp::ReadOk(1, vec![0]) }
-    fn r_minus() -> TestOp { TestOp::ReadOk(1, vec![]) }
+    fn a() -> TestOp {
+        TestOp::AddInvoke(0, 0)
+    }
+    fn a_ok() -> TestOp {
+        TestOp::AddOk(0, 0)
+    }
+    fn r() -> TestOp {
+        TestOp::ReadInvoke(1)
+    }
+    fn r_plus() -> TestOp {
+        TestOp::ReadOk(1, vec![0])
+    }
+    fn r_minus() -> TestOp {
+        TestOp::ReadOk(1, vec![])
+    }
 
     // Multi-element helpers
-    fn a0() -> TestOp { TestOp::AddInvoke(0, 0) }
-    fn a0_ok() -> TestOp { TestOp::AddOk(0, 0) }
-    fn a1() -> TestOp { TestOp::AddInvoke(1, 1) }
-    fn a1_ok() -> TestOp { TestOp::AddOk(1, 1) }
-    fn r2() -> TestOp { TestOp::ReadInvoke(2) }
-    fn r3() -> TestOp { TestOp::ReadInvoke(3) }
-    fn r2_empty() -> TestOp { TestOp::ReadOk(2, vec![]) }
-    fn r2_0() -> TestOp { TestOp::ReadOk(2, vec![0]) }
-    fn r2_1() -> TestOp { TestOp::ReadOk(2, vec![1]) }
-    fn r2_01() -> TestOp { TestOp::ReadOk(2, vec![0, 1]) }
-    fn r3_1() -> TestOp { TestOp::ReadOk(3, vec![1]) }
+    fn a0() -> TestOp {
+        TestOp::AddInvoke(0, 0)
+    }
+    fn a0_ok() -> TestOp {
+        TestOp::AddOk(0, 0)
+    }
+    fn a1() -> TestOp {
+        TestOp::AddInvoke(1, 1)
+    }
+    fn a1_ok() -> TestOp {
+        TestOp::AddOk(1, 1)
+    }
+    fn r2() -> TestOp {
+        TestOp::ReadInvoke(2)
+    }
+    fn r3() -> TestOp {
+        TestOp::ReadInvoke(3)
+    }
+    fn r2_empty() -> TestOp {
+        TestOp::ReadOk(2, vec![])
+    }
+    fn r2_0() -> TestOp {
+        TestOp::ReadOk(2, vec![0])
+    }
+    fn r2_1() -> TestOp {
+        TestOp::ReadOk(2, vec![1])
+    }
+    fn r2_01() -> TestOp {
+        TestOp::ReadOk(2, vec![0, 1])
+    }
+    fn r3_1() -> TestOp {
+        TestOp::ReadOk(3, vec![1])
+    }
 
     #[test]
     fn test_failed_add_ignored() {
@@ -616,10 +650,7 @@ mod tests {
 
     #[test]
     fn test_never_read() {
-        let result = check(vec![
-            TestOp::AddInvoke(0, 0),
-            TestOp::AddOk(0, 0),
-        ]);
+        let result = check(vec![TestOp::AddInvoke(0, 0), TestOp::AddOk(0, 0)]);
 
         assert_eq!(result.valid, Validity::Unknown);
         assert_eq!(result.attempt_count, 1);
@@ -749,18 +780,18 @@ mod tests {
         // Then we read both, 0, then nothing.
         // [a0 a1 r2 r2'1 a0' a1' r2 r2'01 r2 r2'0 r2 r2']
         let result = check(vec![
-            a0(),        // 0
-            a1(),        // 1
-            r2(),        // 2
-            r2_1(),      // 3: sees {1}
-            a0_ok(),     // 4
-            a1_ok(),     // 5
-            r2(),        // 6
-            r2_01(),     // 7: sees {0,1}
-            r2(),        // 8
-            r2_0(),      // 9: sees {0}
-            r2(),        // 10
-            r2_empty(),  // 11: sees {}
+            a0(),       // 0
+            a1(),       // 1
+            r2(),       // 2
+            r2_1(),     // 3: sees {1}
+            a0_ok(),    // 4
+            a1_ok(),    // 5
+            r2(),       // 6
+            r2_01(),    // 7: sees {0,1}
+            r2(),       // 8
+            r2_0(),     // 9: sees {0}
+            r2(),       // 10
+            r2_empty(), // 11: sees {}
         ]);
 
         assert_eq!(result.valid, Validity::Invalid);
@@ -777,16 +808,16 @@ mod tests {
         // t:   0  1    2   3  4     5     6  7   8     9
         // ops: a0 a0'  a1  r2 r2'1  a1'   r2 r3  r3'1  r2'0
         let result = check(vec![
-            a0(),        // 0: add 0 invoke
-            a0_ok(),     // 1: add 0 ok
-            a1(),        // 2: add 1 invoke
-            r2(),        // 3: read invoke (process 2)
-            r2_1(),      // 4: read ok, sees {1}
-            a1_ok(),     // 5: add 1 ok
-            r2(),        // 6: read invoke (process 2)
-            r3(),        // 7: read invoke (process 3)
-            r3_1(),      // 8: read ok (process 3), sees {1}
-            r2_0(),      // 9: read ok (process 2), sees {0}
+            a0(),    // 0: add 0 invoke
+            a0_ok(), // 1: add 0 ok
+            a1(),    // 2: add 1 invoke
+            r2(),    // 3: read invoke (process 2)
+            r2_1(),  // 4: read ok, sees {1}
+            a1_ok(), // 5: add 1 ok
+            r2(),    // 6: read invoke (process 2)
+            r3(),    // 7: read invoke (process 3)
+            r3_1(),  // 8: read ok (process 3), sees {1}
+            r2_0(),  // 9: read ok (process 2), sees {0}
         ]);
 
         assert_eq!(result.valid, Validity::Invalid);
@@ -857,18 +888,18 @@ mod tests {
         // Verify latency values for the write_present_missing test
         // [a0 a1 r2 r2'1 a0' a1' r2 r2'01 r2 r2'0 r2 r2']
         let result = check(vec![
-            a0(),        // 0
-            a1(),        // 1
-            r2(),        // 2
-            r2_1(),      // 3: sees {1}
-            a0_ok(),     // 4
-            a1_ok(),     // 5
-            r2(),        // 6
-            r2_01(),     // 7: sees {0,1}
-            r2(),        // 8
-            r2_0(),      // 9: sees {0}
-            r2(),        // 10
-            r2_empty(),  // 11: sees {}
+            a0(),       // 0
+            a1(),       // 1
+            r2(),       // 2
+            r2_1(),     // 3: sees {1}
+            a0_ok(),    // 4
+            a1_ok(),    // 5
+            r2(),       // 6
+            r2_01(),    // 7: sees {0,1}
+            r2(),       // 8
+            r2_0(),     // 9: sees {0}
+            r2(),       // 10
+            r2_empty(), // 11: sees {}
         ]);
 
         // Both elements are lost
@@ -1035,7 +1066,7 @@ mod tests {
         let result = check(vec![
             TestOp::AddInvoke(0, 1),
             TestOp::ReadInvoke(1),
-            TestOp::ReadOk(1, vec![]),  // overlaps add, can miss
+            TestOp::ReadOk(1, vec![]), // overlaps add, can miss
             TestOp::AddOk(0, 1),
             TestOp::ReadInvoke(1),
             TestOp::ReadOk(1, vec![1]),
@@ -1095,7 +1126,7 @@ mod tests {
             TestOp::AddInvoke(1, 2),
             TestOp::AddOk(0, 1),
             TestOp::ReadInvoke(2),
-            TestOp::ReadOk(2, vec![1]),  // y not yet ok
+            TestOp::ReadOk(2, vec![1]), // y not yet ok
             TestOp::AddOk(1, 2),
             TestOp::ReadInvoke(2),
             TestOp::ReadOk(2, vec![1, 2]),
@@ -1170,9 +1201,9 @@ mod tests {
             TestOp::AddInvoke(2, 3),
             TestOp::AddOk(2, 3),
             TestOp::ReadInvoke(0),
-            TestOp::ReadOk(0, vec![1]),  // sees only 1
+            TestOp::ReadOk(0, vec![1]), // sees only 1
             TestOp::ReadInvoke(1),
-            TestOp::ReadOk(1, vec![1, 2]),  // sees 1, 2 (not 3)
+            TestOp::ReadOk(1, vec![1, 2]), // sees 1, 2 (not 3)
         ]);
 
         // Element 1: stable with no staleness (seen in all reads, no absent)
@@ -1340,9 +1371,9 @@ mod tests {
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
-        use std::collections::{HashMap, HashSet};
+        use rand::seq::{IndexedRandom, IteratorRandom};
         use rand::{Rng, SeedableRng};
-        use rand::seq::{IteratorRandom, IndexedRandom};
+        use std::collections::{HashMap, HashSet};
 
         /// Controls whether to generate valid or invalid histories
         #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1449,7 +1480,11 @@ mod tests {
             let mut inflight: HashMap<u64, Option<SkelOp>> = HashMap::new();
             let mut next_read_id = 0;
             let mut epoch_add_ratio = config.add_ratio;
-            let epoch_length = if config.burstiness > 0.5 { 100 } else { config.ops_total };
+            let epoch_length = if config.burstiness > 0.5 {
+                100
+            } else {
+                config.ops_total
+            };
 
             for i in 0..config.ops_total {
                 // Update add_ratio for bursty behavior
@@ -1462,7 +1497,10 @@ mod tests {
                 }
 
                 // Choose process (with burstiness, favor recent processes)
-                let process = if config.burstiness > 0.5 && !inflight.is_empty() && rng.random_bool(config.burstiness) {
+                let process = if config.burstiness > 0.5
+                    && !inflight.is_empty()
+                    && rng.random_bool(config.burstiness)
+                {
                     *inflight.keys().choose(rng).unwrap()
                 } else {
                     rng.random_range(0..config.processes) as u64
@@ -1472,17 +1510,24 @@ mod tests {
                 let has_inflight = inflight.get(&process).and_then(|x| x.as_ref()).is_some();
 
                 // Decide whether to complete existing operation or start new one
-                let should_complete = has_inflight && (config.concurrency == 0.0 || rng.random_bool(1.0 - config.concurrency));
+                let should_complete = has_inflight
+                    && (config.concurrency == 0.0 || rng.random_bool(1.0 - config.concurrency));
 
                 if should_complete {
                     // Complete the inflight operation
                     if let Some(Some(inflight_op)) = inflight.get(&process) {
                         match inflight_op {
                             SkelOp::AddInvoke { process, elem } => {
-                                ops.push(SkelOp::AddOk { process: *process, elem: *elem });
+                                ops.push(SkelOp::AddOk {
+                                    process: *process,
+                                    elem: *elem,
+                                });
                             }
                             SkelOp::ReadInvoke { process, read_id } => {
-                                ops.push(SkelOp::ReadOk { process: *process, read_id: *read_id });
+                                ops.push(SkelOp::ReadOk {
+                                    process: *process,
+                                    read_id: *read_id,
+                                });
                             }
                             _ => unreachable!(),
                         }
@@ -1509,10 +1554,16 @@ mod tests {
                 if let Some(op) = inflight_op {
                     match op {
                         SkelOp::AddInvoke { process, elem } => {
-                            ops.push(SkelOp::AddOk { process: *process, elem: *elem });
+                            ops.push(SkelOp::AddOk {
+                                process: *process,
+                                elem: *elem,
+                            });
                         }
                         SkelOp::ReadInvoke { process, read_id } => {
-                            ops.push(SkelOp::ReadOk { process: *process, read_id: *read_id });
+                            ops.push(SkelOp::ReadOk {
+                                process: *process,
+                                read_id: *read_id,
+                            });
                         }
                         _ => unreachable!(),
                     }
@@ -1537,10 +1588,10 @@ mod tests {
             for (idx, op) in skeleton.iter().enumerate() {
                 match op {
                     SkelOp::AddInvoke { elem, .. } => {
-                        add_invoke_idx.entry(*elem).or_insert_with(Vec::new).push(idx);
+                        add_invoke_idx.entry(*elem).or_default().push(idx);
                     }
                     SkelOp::AddOk { elem, .. } => {
-                        add_ok_idx.entry(*elem).or_insert_with(Vec::new).push(idx);
+                        add_ok_idx.entry(*elem).or_default().push(idx);
                     }
                     SkelOp::ReadInvoke { read_id, .. } => {
                         read_invoke_idx.insert(*read_id, idx);
@@ -1565,14 +1616,17 @@ mod tests {
                         let definitely_visible = ok_pos < read_invoke_position;
 
                         // Element may be visible if operations overlap
-                        let possibly_visible = ok_pos >= read_invoke_position && ok_pos < read_ok_position;
+                        let possibly_visible =
+                            ok_pos >= read_invoke_position && ok_pos < read_ok_position;
 
                         if definitely_visible {
                             if !result.contains(elem) {
                                 result.push(*elem);
                             }
                             break; // One add_ok is enough to make it visible
-                        } else if possibly_visible && config.target_validity == TargetValidity::ForceValid {
+                        } else if possibly_visible
+                            && config.target_validity == TargetValidity::ForceValid
+                        {
                             // For valid histories, randomly include overlapping adds
                             if rng.random_bool(0.5) && !result.contains(elem) {
                                 result.push(*elem);
@@ -1782,7 +1836,9 @@ mod tests {
 
             // With sequential execution and anomaly injection, we SHOULD detect invalidity
             assert!(
-                result.valid == Validity::Invalid || result.lost_count > 0 || result.stale_count > 0,
+                result.valid == Validity::Invalid
+                    || result.lost_count > 0
+                    || result.stale_count > 0,
                 "Sequential invalid history was not detected as invalid. Valid: {:?}, Lost: {}, Stale: {}",
                 result.valid,
                 result.lost_count,
@@ -1794,19 +1850,17 @@ mod tests {
         fn test_deterministic_invalid_history() {
             // Create a simple, deterministic invalid history:
             // Add element 1, read sees it, then another read doesn't see it (lost element)
-            let mut ops = Vec::new();
-
-            // Process 0 adds element 1
-            ops.push(TestOp::AddInvoke(0, 1));
-            ops.push(TestOp::AddOk(0, 1));
-
-            // Process 1 reads and sees element 1
-            ops.push(TestOp::ReadInvoke(1));
-            ops.push(TestOp::ReadOk(1, vec![1]));
-
-            // Process 2 reads but doesn't see element 1 (invalid - lost element)
-            ops.push(TestOp::ReadInvoke(2));
-            ops.push(TestOp::ReadOk(2, vec![])); // Lost element 1
+            let ops = vec![
+                // Process 0 adds element 1
+                TestOp::AddInvoke(0, 1),
+                TestOp::AddOk(0, 1),
+                // Process 1 reads and sees element 1
+                TestOp::ReadInvoke(1),
+                TestOp::ReadOk(1, vec![1]),
+                // Process 2 reads but doesn't see element 1 (invalid - lost element)
+                TestOp::ReadInvoke(2),
+                TestOp::ReadOk(2, vec![]), // Lost element 1
+            ];
 
             let result = check(ops);
 
@@ -1855,8 +1909,14 @@ mod tests {
             let history = gen_history(config, 42);
 
             // Count read operations
-            let read_count = history.iter().filter(|op| matches!(op, TestOp::ReadInvoke(_))).count();
-            let add_count = history.iter().filter(|op| matches!(op, TestOp::AddInvoke(_, _))).count();
+            let read_count = history
+                .iter()
+                .filter(|op| matches!(op, TestOp::ReadInvoke(_)))
+                .count();
+            let add_count = history
+                .iter()
+                .filter(|op| matches!(op, TestOp::AddInvoke(_, _)))
+                .count();
 
             let result = check(history);
 
@@ -1870,8 +1930,14 @@ mod tests {
             let history = gen_history(config, 42);
 
             // Count add operations
-            let add_count = history.iter().filter(|op| matches!(op, TestOp::AddInvoke(_, _))).count();
-            let read_count = history.iter().filter(|op| matches!(op, TestOp::ReadInvoke(_))).count();
+            let add_count = history
+                .iter()
+                .filter(|op| matches!(op, TestOp::AddInvoke(_, _)))
+                .count();
+            let read_count = history
+                .iter()
+                .filter(|op| matches!(op, TestOp::ReadInvoke(_)))
+                .count();
 
             let result = check(history);
 
