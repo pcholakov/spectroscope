@@ -61,6 +61,62 @@ pub struct Op<T> {
     pub process: ProcessId,
 }
 
+impl<T> Op<T> {
+    /// Create an add invocation.
+    pub fn add_invoke(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+        Self {
+            index,
+            op_type: OpType::Invoke,
+            f: OpFn::Add,
+            value: OpValue::Single(value),
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create an add completion.
+    pub fn add_ok(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+        Self {
+            index,
+            op_type: OpType::Ok,
+            f: OpFn::Add,
+            value: OpValue::Single(value),
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create a read invocation.
+    pub fn read_invoke(index: usize, process: impl Into<ProcessId>) -> Self {
+        Self {
+            index,
+            op_type: OpType::Invoke,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create a read completion with observed values.
+    pub fn read_ok(index: usize, process: impl Into<ProcessId>, values: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            index,
+            op_type: OpType::Ok,
+            f: OpFn::Read,
+            value: OpValue::Vec(values.into_iter().collect()),
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Set the timestamp for this operation.
+    pub fn at(mut self, time: Duration) -> Self {
+        self.time = Some(time);
+        self
+    }
+}
+
 /// Value associated with an operation.
 #[derive(Debug, Clone)]
 pub enum OpValue<T> {

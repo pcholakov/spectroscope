@@ -475,7 +475,7 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::{HashSet, HashSetExt};
+    use ahash::HashSet;
     use std::time::Duration;
     use crate::history::ProcessId;
 
@@ -762,47 +762,13 @@ mod tests {
     fn test_duplicates_in_read() {
         // Read returns an element multiple times (duplicate)
         let mut history = History::new();
-
-        // Add element 0
-        history.push(Op {
-            index: 0,
-            op_type: OpType::Invoke,
-            f: OpFn::Add,
-            value: OpValue::Single(0),
-            time: Some(Duration::ZERO),
-            process: ProcessId(0),
-        });
-        history.push(Op {
-            index: 1,
-            op_type: OpType::Ok,
-            f: OpFn::Add,
-            value: OpValue::Single(0),
-            time: Some(Duration::from_nanos(1_000_000)),
-            process: ProcessId(0),
-        });
-
-        // Read invoke
-        history.push(Op {
-            index: 2,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(Duration::from_nanos(2_000_000)),
-            process: ProcessId(1),
-        });
-
+        history.push(Op::add_invoke(0, 0u64, 0).at(Duration::ZERO));
+        history.push(Op::add_ok(1, 0u64, 0).at(Duration::from_millis(1)));
+        history.push(Op::read_invoke(2, 1u64).at(Duration::from_millis(2)));
         // Read returns element 0 three times (duplicate!)
-        history.push(Op {
-            index: 3,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Vec(vec![0, 0, 0]),
-            time: Some(Duration::from_nanos(3_000_000)),
-            process: ProcessId(1),
-        });
+        history.push(Op::read_ok(3, 1u64, [0, 0, 0]).at(Duration::from_millis(3)));
 
-        let checker = SetFullChecker::default();
-        let result = checker.check(&history);
+        let result = SetFullChecker::default().check(&history);
 
         // Should be invalid due to duplicates
         assert_eq!(result.valid, Validity::Invalid);
@@ -847,73 +813,25 @@ mod tests {
     fn test_worst_stale_ordering() {
         // Create multiple stale elements with different latencies
         // and verify worst_stale is ordered by latency descending
-
         let mut history = History::new();
 
-        // Add elements 0, 1, 2
+        // Add elements 0, 1, 2 at staggered times
         for elem in 0..3 {
-            history.push(Op {
-                index: elem * 2,
-                op_type: OpType::Invoke,
-                f: OpFn::Add,
-                value: OpValue::Single(elem as i32),
-                time: Some(Duration::from_nanos(elem as u64 * 2 * 1_000_000)),
-                process: ProcessId(elem as u64),
-            });
-            history.push(Op {
-                index: elem * 2 + 1,
-                op_type: OpType::Ok,
-                f: OpFn::Add,
-                value: OpValue::Single(elem as i32),
-                time: Some(Duration::from_nanos((elem * 2 + 1) as u64 * 1_000_000)),
-                process: ProcessId(elem as u64),
-            });
+            let ms = |n: usize| Duration::from_millis(n as u64);
+            history.push(Op::add_invoke(elem * 2, elem as u64, elem as i32).at(ms(elem * 2)));
+            history.push(Op::add_ok(elem * 2 + 1, elem as u64, elem as i32).at(ms(elem * 2 + 1)));
         }
-        // Now: indices 0-5 are adds
-        // Element 0 known at index 1, time 1M
-        // Element 1 known at index 3, time 3M
-        // Element 2 known at index 5, time 5M
+        // Element 0 known at index 1 (1ms), Element 1 at index 3 (3ms), Element 2 at index 5 (5ms)
 
-        // Read that misses all (creating absent records at different times)
-        // Index 6: read invoke
-        history.push(Op {
-            index: 6,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(Duration::from_nanos(6_000_000)),
-            process: ProcessId(10),
-        });
-        // Read returns empty - all elements absent
-        history.push(Op {
-            index: 7,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Set(HashSet::new()),
-            time: Some(Duration::from_nanos(7_000_000)),
-            process: ProcessId(10),
-        });
+        // Read that misses all (creating absent records)
+        history.push(Op::read_invoke(6, 10u64).at(Duration::from_millis(6)));
+        history.push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Duration::from_millis(7)));
 
         // Read that sees all (making them stable)
-        history.push(Op {
-            index: 8,
-            op_type: OpType::Invoke,
-            f: OpFn::Read,
-            value: OpValue::None,
-            time: Some(Duration::from_nanos(8_000_000)),
-            process: ProcessId(10),
-        });
-        history.push(Op {
-            index: 9,
-            op_type: OpType::Ok,
-            f: OpFn::Read,
-            value: OpValue::Set(HashSet::from_iter([0, 1, 2])),
-            time: Some(Duration::from_nanos(9_000_000)),
-            process: ProcessId(10),
-        });
+        history.push(Op::read_invoke(8, 10u64).at(Duration::from_millis(8)));
+        history.push(Op::read_ok(9, 10u64, [0, 1, 2]).at(Duration::from_millis(9)));
 
-        let checker = SetFullChecker::default();
-        let result = checker.check(&history);
+        let result = SetFullChecker::default().check(&history);
 
         // All elements are stable with different latencies
         assert_eq!(result.stable_count, 3);
