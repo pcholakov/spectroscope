@@ -1,21 +1,20 @@
-# Spectra
+# Spectroscope
 
 Consistency checkers for distributed systems testing.
 
-Spectra verifies that operation histories from distributed systems conform to expected consistency models. Currently implements a set linearizability checker derived from [Jepsen](https://github.com/jepsen-io/jepsen).
+Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. Currently implements a set linearizability checker derived from [Jepsen](https://github.com/jepsen-io/jepsen).
 
 ## Installation
 
 ```toml
 [dependencies]
-spectra = "0.1"
+spectroscope = "0.1"
 ```
 
 ## Usage
 
 ```rust
-use std::time::Duration;
-use spectra::{History, Op, SetFullChecker, Validity};
+use spectroscope::{History, Op, SetFullChecker, Validity};
 
 // Build a history of operations from your distributed system
 let mut history = History::new();

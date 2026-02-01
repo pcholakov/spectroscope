@@ -1,13 +1,13 @@
 //! Consistency checkers for distributed systems testing.
 //!
-//! Spectra verifies that operation histories from distributed systems conform to
+//! Spectroscope verifies that operation histories from distributed systems conform to
 //! expected consistency models. Currently implements a set linearizability checker
 //! derived from [Jepsen](https://github.com/jepsen-io/jepsen).
 //!
 //! # Quick Start
 //!
 //! ```
-//! use spectra::{History, Op, SetFullChecker, Validity};
+//! use spectroscope::{History, Op, SetFullChecker, Validity};
 //!
 //! let mut history = History::new();
 //!

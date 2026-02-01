@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use spectra::history::{History, Op};
-use spectra::set_full::{SetFullChecker, Validity};
+use spectroscope::history::{History, Op};
+use spectroscope::set_full::{SetFullChecker, Validity};
 
 fn main() {
     // A history records operations from concurrent processes.
