@@ -39,7 +39,7 @@
 pub mod history;
 pub mod set_full;
 
-pub use history::{History, Op, OpFn, OpType, OpValue, ProcessId};
+pub use history::{History, Op, OpFn, OpType, OpValue, Pid, Timestamp};
 pub use set_full::{
     ElementOutcome, SetFullChecker, SetFullOptions, SetFullResult, Validity, WorstStaleEntry,
 };

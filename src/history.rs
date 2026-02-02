@@ -11,11 +11,35 @@ use std::time::Duration;
 
 /// Process or thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub struct ProcessId(pub u64);
+pub struct Pid(pub u64);
 
-impl From<u64> for ProcessId {
+impl From<u64> for Pid {
     fn from(v: u64) -> Self {
         Self(v)
+    }
+}
+
+/// A timestamp for operation ordering, relative to an arbitrary epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Timestamp(Duration);
+
+impl Timestamp {
+    /// Create a timestamp from milliseconds.
+    #[must_use]
+    pub fn from_millis(ms: u64) -> Self {
+        Self(Duration::from_millis(ms))
+    }
+
+    /// Get the underlying Duration.
+    #[must_use]
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+}
+
+impl From<Duration> for Timestamp {
+    fn from(d: Duration) -> Self {
+        Self(d)
     }
 }
 
@@ -55,14 +79,14 @@ pub struct Op<T> {
     /// For Read: None on invoke, Some(set contents) on completion.
     pub value: OpValue<T>,
     /// Timestamp (optional, used for latency calculations).
-    pub time: Option<Duration>,
+    pub time: Option<Timestamp>,
     /// Process/thread that performed this operation.
-    pub process: ProcessId,
+    pub process: Pid,
 }
 
 impl<T> Op<T> {
     /// Create an add invocation.
-    pub fn add_invoke(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+    pub fn add_invoke(index: usize, process: impl Into<Pid>, value: T) -> Self {
         Self {
             index,
             op_type: OpType::Invoke,
@@ -74,7 +98,7 @@ impl<T> Op<T> {
     }
 
     /// Create an add completion.
-    pub fn add_ok(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+    pub fn add_ok(index: usize, process: impl Into<Pid>, value: T) -> Self {
         Self {
             index,
             op_type: OpType::Ok,
@@ -86,7 +110,7 @@ impl<T> Op<T> {
     }
 
     /// Create a read invocation.
-    pub fn read_invoke(index: usize, process: impl Into<ProcessId>) -> Self {
+    pub fn read_invoke(index: usize, process: impl Into<Pid>) -> Self {
         Self {
             index,
             op_type: OpType::Invoke,
@@ -100,7 +124,7 @@ impl<T> Op<T> {
     /// Create a read completion with observed values.
     pub fn read_ok(
         index: usize,
-        process: impl Into<ProcessId>,
+        process: impl Into<Pid>,
         values: impl IntoIterator<Item = T>,
     ) -> Self {
         Self {
@@ -114,7 +138,7 @@ impl<T> Op<T> {
     }
 
     /// Create an add with indeterminate outcome (timeout, crash).
-    pub fn add_info(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+    pub fn add_info(index: usize, process: impl Into<Pid>, value: T) -> Self {
         Self {
             index,
             op_type: OpType::Info,
@@ -126,7 +150,7 @@ impl<T> Op<T> {
     }
 
     /// Create an add that definitely failed.
-    pub fn add_fail(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+    pub fn add_fail(index: usize, process: impl Into<Pid>, value: T) -> Self {
         Self {
             index,
             op_type: OpType::Fail,
@@ -138,7 +162,7 @@ impl<T> Op<T> {
     }
 
     /// Create a read with indeterminate outcome.
-    pub fn read_info(index: usize, process: impl Into<ProcessId>) -> Self {
+    pub fn read_info(index: usize, process: impl Into<Pid>) -> Self {
         Self {
             index,
             op_type: OpType::Info,
@@ -150,7 +174,7 @@ impl<T> Op<T> {
     }
 
     /// Create a read that definitely failed.
-    pub fn read_fail(index: usize, process: impl Into<ProcessId>) -> Self {
+    pub fn read_fail(index: usize, process: impl Into<Pid>) -> Self {
         Self {
             index,
             op_type: OpType::Fail,
@@ -163,7 +187,7 @@ impl<T> Op<T> {
 
     /// Set the timestamp for this operation.
     #[must_use]
-    pub fn at(mut self, time: Duration) -> Self {
+    pub fn at(mut self, time: Timestamp) -> Self {
         self.time = Some(time);
         self
     }

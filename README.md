@@ -2,7 +2,7 @@
 
 Consistency checkers for distributed systems testing.
 
-Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. Currently implements a set linearizability checker derived from [Jepsen](https://github.com/jepsen-io/jepsen).
+Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. This is a port of [Jepsen](https://github.com/jepsen-io/jepsen)'s set-full workload linearizability checker.
 
 ## Installation
 
@@ -58,4 +58,4 @@ let result = checker.check(&history);
 
 ## License
 
-EPL-1.0 (derived from Jepsen)
+EPL-1.0

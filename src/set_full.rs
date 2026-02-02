@@ -16,14 +16,15 @@
 //! after being added (zero stable latency), otherwise it's considered "stale" and the
 //! check fails.
 //!
-//! Derived from Jepsen's set-full checker, licensed under EPL-1.0.
+//! Derived from [Jepsen's set-full
+//! checker](https://jepsen-io.github.io/jepsen/jepsen.checker.html#var-set-full).
 
 use std::hash::Hash;
 use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt};
 
-use crate::history::{History, Op, OpFn, OpType, OpValue};
+use crate::history::{History, Op, OpFn, OpType, OpValue, Timestamp};
 
 /// Options for the set-full checker.
 #[derive(Debug, Clone, Default)]
@@ -146,7 +147,7 @@ struct ElementState<T> {
 #[derive(Debug, Clone)]
 struct OpRef {
     index: usize,
-    time: Option<Duration>,
+    time: Option<Timestamp>,
 }
 
 impl<T: Clone> ElementState<T> {
@@ -237,12 +238,12 @@ impl<T: Clone> ElementState<T> {
 
         let stable_latency_ms = if stable {
             let stable_time = if let Some(ref la) = self.last_absent {
-                la.time.map(|t| t + Duration::from_nanos(1))
+                la.time.map(|t| t.as_duration() + Duration::from_nanos(1))
             } else {
                 Some(Duration::ZERO)
             };
             match (stable_time, known_time) {
-                (Some(st), Some(kt)) => Some(st.saturating_sub(kt).as_millis() as u64),
+                (Some(st), Some(kt)) => Some(st.saturating_sub(kt.as_duration()).as_millis() as u64),
                 _ => Some(0),
             }
         } else {
@@ -251,12 +252,12 @@ impl<T: Clone> ElementState<T> {
 
         let lost_latency_ms = if lost {
             let lost_time = if let Some(ref lp) = self.last_present {
-                lp.time.map(|t| t + Duration::from_nanos(1))
+                lp.time.map(|t| t.as_duration() + Duration::from_nanos(1))
             } else {
                 Some(Duration::ZERO)
             };
             match (lost_time, known_time) {
-                (Some(lt), Some(kt)) => Some(lt.saturating_sub(kt).as_millis() as u64),
+                (Some(lt), Some(kt)) => Some(lt.saturating_sub(kt.as_duration()).as_millis() as u64),
                 _ => Some(0),
             }
         } else {
@@ -269,9 +270,9 @@ impl<T: Clone> ElementState<T> {
             stable_latency_ms,
             lost_latency_ms,
             known_index: self.known.as_ref().map(|k| k.index),
-            known_time: self.known.as_ref().and_then(|k| k.time),
+            known_time: self.known.as_ref().and_then(|k| k.time.map(|t| t.as_duration())),
             last_absent_index: self.last_absent.as_ref().map(|a| a.index),
-            last_absent_time: self.last_absent.as_ref().and_then(|a| a.time),
+            last_absent_time: self.last_absent.as_ref().and_then(|a| a.time.map(|t| t.as_duration())),
         }
     }
 }
@@ -492,7 +493,7 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::ProcessId;
+    use crate::history::Pid;
     use std::collections::HashSet;
     use std::time::Duration;
 
@@ -526,8 +527,8 @@ mod tests {
                 op_type,
                 f,
                 value,
-                time: Some(Duration::from_nanos(idx as u64 * 1_000_000)), // microseconds, like Jepsen
-                process: ProcessId::from(process),
+                time: Some(Duration::from_nanos(idx as u64 * 1_000_000).into()), // microseconds, like Jepsen
+                process: Pid::from(process),
             });
         }
         history
@@ -840,11 +841,11 @@ mod tests {
     fn test_duplicates_in_read() {
         // Read returns an element multiple times (duplicate)
         let mut history = History::new();
-        history.push(Op::add_invoke(0, 0u64, 0).at(Duration::ZERO));
-        history.push(Op::add_ok(1, 0u64, 0).at(Duration::from_millis(1)));
-        history.push(Op::read_invoke(2, 1u64).at(Duration::from_millis(2)));
+        history.push(Op::add_invoke(0, 0u64, 0).at(Timestamp::from_millis(0)));
+        history.push(Op::add_ok(1, 0u64, 0).at(Timestamp::from_millis(1)));
+        history.push(Op::read_invoke(2, 1u64).at(Timestamp::from_millis(2)));
         // Read returns element 0 three times (duplicate!)
-        history.push(Op::read_ok(3, 1u64, [0, 0, 0]).at(Duration::from_millis(3)));
+        history.push(Op::read_ok(3, 1u64, [0, 0, 0]).at(Timestamp::from_millis(3)));
 
         let result = SetFullChecker::default().check(&history);
 
@@ -895,19 +896,19 @@ mod tests {
 
         // Add elements 0, 1, 2 at staggered times
         for elem in 0..3 {
-            let ms = |n: usize| Duration::from_millis(n as u64);
+            let ms = |n: usize| Timestamp::from_millis(n as u64);
             history.push(Op::add_invoke(elem * 2, elem as u64, elem as i32).at(ms(elem * 2)));
             history.push(Op::add_ok(elem * 2 + 1, elem as u64, elem as i32).at(ms(elem * 2 + 1)));
         }
         // Element 0 known at index 1 (1ms), Element 1 at index 3 (3ms), Element 2 at index 5 (5ms)
 
         // Read that misses all (creating absent records)
-        history.push(Op::read_invoke(6, 10u64).at(Duration::from_millis(6)));
-        history.push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Duration::from_millis(7)));
+        history.push(Op::read_invoke(6, 10u64).at(Timestamp::from_millis(6)));
+        history.push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Timestamp::from_millis(7)));
 
         // Read that sees all (making them stable)
-        history.push(Op::read_invoke(8, 10u64).at(Duration::from_millis(8)));
-        history.push(Op::read_ok(9, 10u64, [0, 1, 2]).at(Duration::from_millis(9)));
+        history.push(Op::read_invoke(8, 10u64).at(Timestamp::from_millis(8)));
+        history.push(Op::read_ok(9, 10u64, [0, 1, 2]).at(Timestamp::from_millis(9)));
 
         let result = SetFullChecker::default().check(&history);
 
@@ -937,12 +938,12 @@ mod tests {
         let mut history = History::new();
 
         // Read sees element 42, but there's no add for it
-        history.push(Op::read_invoke(0, 0u64).at(Duration::from_millis(0)));
-        history.push(Op::read_ok(1, 0u64, [42]).at(Duration::from_millis(1)));
+        history.push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)));
+        history.push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)));
 
         // Second read also sees it
-        history.push(Op::read_invoke(2, 0u64).at(Duration::from_millis(2)));
-        history.push(Op::read_ok(3, 0u64, [42]).at(Duration::from_millis(3)));
+        history.push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)));
+        history.push(Op::read_ok(3, 0u64, [42]).at(Timestamp::from_millis(3)));
 
         let result = SetFullChecker::default().check(&history);
 
@@ -957,11 +958,11 @@ mod tests {
         // Element appears in read, then disappears - should be lost
         let mut history = History::new();
 
-        history.push(Op::read_invoke(0, 0u64).at(Duration::from_millis(0)));
-        history.push(Op::read_ok(1, 0u64, [42]).at(Duration::from_millis(1)));
+        history.push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)));
+        history.push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)));
 
-        history.push(Op::read_invoke(2, 0u64).at(Duration::from_millis(2)));
-        history.push(Op::read_ok(3, 0u64, []).at(Duration::from_millis(3)));
+        history.push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)));
+        history.push(Op::read_ok(3, 0u64, []).at(Timestamp::from_millis(3)));
 
         let result = SetFullChecker::default().check(&history);
 
@@ -977,11 +978,11 @@ mod tests {
         let mut history = History::new();
 
         // Only the completion, no invoke
-        history.push(Op::add_ok(0, 0u64, 99).at(Duration::from_millis(0)));
+        history.push(Op::add_ok(0, 0u64, 99).at(Timestamp::from_millis(0)));
 
         // Read sees the element
-        history.push(Op::read_invoke(1, 1u64).at(Duration::from_millis(1)));
-        history.push(Op::read_ok(2, 1u64, [99]).at(Duration::from_millis(2)));
+        history.push(Op::read_invoke(1, 1u64).at(Timestamp::from_millis(1)));
+        history.push(Op::read_ok(2, 1u64, [99]).at(Timestamp::from_millis(2)));
 
         let result = SetFullChecker::default().check(&history);
 
@@ -997,10 +998,10 @@ mod tests {
 
         // Process 0: add invoke, then read invoke, then read ok
         // The read_ok should match the read_invoke, not the add_invoke
-        history.push(Op::add_invoke(0, 0u64, 1).at(Duration::from_millis(0)));
-        history.push(Op::read_invoke(1, 0u64).at(Duration::from_millis(1)));
-        history.push(Op::read_ok(2, 0u64, [1]).at(Duration::from_millis(2)));
-        history.push(Op::add_ok(3, 0u64, 1).at(Duration::from_millis(3)));
+        history.push(Op::add_invoke(0, 0u64, 1).at(Timestamp::from_millis(0)));
+        history.push(Op::read_invoke(1, 0u64).at(Timestamp::from_millis(1)));
+        history.push(Op::read_ok(2, 0u64, [1]).at(Timestamp::from_millis(2)));
+        history.push(Op::add_ok(3, 0u64, 1).at(Timestamp::from_millis(3)));
 
         let result = SetFullChecker::default().check(&history);
 
