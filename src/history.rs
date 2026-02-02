@@ -191,6 +191,12 @@ impl<T> Op<T> {
         self.time = Some(time);
         self
     }
+
+    /// Set the timestamp for this operation in milliseconds.
+    #[must_use]
+    pub fn at_millis(self, ms: u64) -> Self {
+        self.at(Timestamp::from_millis(ms))
+    }
 }
 
 /// Value associated with an operation.
