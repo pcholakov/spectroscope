@@ -113,6 +113,54 @@ impl<T> Op<T> {
         }
     }
 
+    /// Create an add with indeterminate outcome (timeout, crash).
+    pub fn add_info(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+        Self {
+            index,
+            op_type: OpType::Info,
+            f: OpFn::Add,
+            value: OpValue::Single(value),
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create an add that definitely failed.
+    pub fn add_fail(index: usize, process: impl Into<ProcessId>, value: T) -> Self {
+        Self {
+            index,
+            op_type: OpType::Fail,
+            f: OpFn::Add,
+            value: OpValue::Single(value),
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create a read with indeterminate outcome.
+    pub fn read_info(index: usize, process: impl Into<ProcessId>) -> Self {
+        Self {
+            index,
+            op_type: OpType::Info,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: None,
+            process: process.into(),
+        }
+    }
+
+    /// Create a read that definitely failed.
+    pub fn read_fail(index: usize, process: impl Into<ProcessId>) -> Self {
+        Self {
+            index,
+            op_type: OpType::Fail,
+            f: OpFn::Read,
+            value: OpValue::None,
+            time: None,
+            process: process.into(),
+        }
+    }
+
     /// Set the timestamp for this operation.
     #[must_use]
     pub fn at(mut self, time: Duration) -> Self {

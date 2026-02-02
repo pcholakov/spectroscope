@@ -594,22 +594,8 @@ mod tests {
     fn test_failed_add_ignored() {
         // Failed adds should not affect element tracking
         let mut history = History::new();
-        history.push(Op {
-            index: 0,
-            op_type: OpType::Invoke,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: None,
-            process: ProcessId(0),
-        });
-        history.push(Op {
-            index: 1,
-            op_type: OpType::Fail,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: None,
-            process: ProcessId(0),
-        });
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_fail(1, 0u64, 1));
         history.push(Op::read_invoke(2, 0u64));
         history.push(Op::read_ok(3, 0u64, Vec::<i32>::new()));
 
@@ -623,22 +609,8 @@ mod tests {
     fn test_info_operations_ignored() {
         // Info (indeterminate) operations should be handled gracefully
         let mut history = History::new();
-        history.push(Op {
-            index: 0,
-            op_type: OpType::Invoke,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: None,
-            process: ProcessId(0),
-        });
-        history.push(Op {
-            index: 1,
-            op_type: OpType::Info,
-            f: OpFn::Add,
-            value: OpValue::Single(1),
-            time: None,
-            process: ProcessId(0),
-        });
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_info(1, 0u64, 1));
         history.push(Op::read_invoke(2, 1u64));
         history.push(Op::read_ok(3, 1u64, vec![1]));
 
