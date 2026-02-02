@@ -268,12 +268,56 @@ impl<T> History<T> {
     /// Find the invocation for a given completion by searching backward.
     #[must_use]
     pub fn invocation(&self, completion_pos: usize) -> Option<&Op<T>> {
-        if completion_pos == 0 || completion_pos > self.ops.len() {
+        if completion_pos == 0 || completion_pos >= self.ops.len() {
             return None;
         }
         let completion = &self.ops[completion_pos];
         self.ops[..completion_pos].iter().rev().find(|op| {
             op.process == completion.process && op.op_type == OpType::Invoke && op.f == completion.f
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invocation_at_len_returns_none() {
+        let mut history: History<i32> = History::new();
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_ok(1, 0u64, 1));
+
+        // Calling invocation with index == len should return None, not panic
+        assert!(history.invocation(history.len()).is_none());
+    }
+
+    #[test]
+    fn test_invocation_beyond_len_returns_none() {
+        let mut history: History<i32> = History::new();
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_ok(1, 0u64, 1));
+
+        // Calling invocation with index > len should return None
+        assert!(history.invocation(history.len() + 1).is_none());
+        assert!(history.invocation(history.len() + 100).is_none());
+    }
+
+    #[test]
+    fn test_invocation_at_zero_returns_none() {
+        let mut history: History<i32> = History::new();
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_ok(1, 0u64, 1));
+
+        // Position 0 has no prior invoke to find
+        assert!(history.invocation(0).is_none());
+    }
+
+    #[test]
+    fn test_invocation_empty_history() {
+        let history: History<i32> = History::new();
+
+        assert!(history.invocation(0).is_none());
+        assert!(history.invocation(1).is_none());
     }
 }

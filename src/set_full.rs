@@ -243,8 +243,10 @@ impl<T: Clone> ElementState<T> {
                 Some(Duration::ZERO)
             };
             match (stable_time, known_time) {
-                (Some(st), Some(kt)) => Some(st.saturating_sub(kt.as_duration()).as_millis() as u64),
-                _ => Some(0),
+                (Some(st), Some(kt)) => {
+                    Some(st.saturating_sub(kt.as_duration()).as_millis() as u64)
+                }
+                _ => None, // Unknown latency when timestamps missing
             }
         } else {
             None
@@ -257,8 +259,10 @@ impl<T: Clone> ElementState<T> {
                 Some(Duration::ZERO)
             };
             match (lost_time, known_time) {
-                (Some(lt), Some(kt)) => Some(lt.saturating_sub(kt.as_duration()).as_millis() as u64),
-                _ => Some(0),
+                (Some(lt), Some(kt)) => {
+                    Some(lt.saturating_sub(kt.as_duration()).as_millis() as u64)
+                }
+                _ => None, // Unknown latency when timestamps missing
             }
         } else {
             None
@@ -270,9 +274,15 @@ impl<T: Clone> ElementState<T> {
             stable_latency_ms,
             lost_latency_ms,
             known_index: self.known.as_ref().map(|k| k.index),
-            known_time: self.known.as_ref().and_then(|k| k.time.map(|t| t.as_duration())),
+            known_time: self
+                .known
+                .as_ref()
+                .and_then(|k| k.time.map(|t| t.as_duration())),
             last_absent_index: self.last_absent.as_ref().map(|a| a.index),
-            last_absent_time: self.last_absent.as_ref().and_then(|a| a.time.map(|t| t.as_duration())),
+            last_absent_time: self
+                .last_absent
+                .as_ref()
+                .and_then(|a| a.time.map(|t| t.as_duration())),
         }
     }
 }
@@ -418,10 +428,16 @@ impl SetFullChecker {
             }
         }
 
-        // Stale elements: stable but with non-zero latency
+        // Stale elements: stable but with non-zero latency, or with index-based staleness
+        // when timestamps are missing
         let mut stale_results: Vec<&ElementResult<T>> = results
             .iter()
-            .filter(|r| r.outcome == ElementOutcome::Stable && r.stable_latency_ms.unwrap_or(0) > 0)
+            .filter(|r| {
+                r.outcome == ElementOutcome::Stable
+                    && (r.stable_latency_ms.unwrap_or(0) > 0
+                        || r.last_absent_index
+                            .is_some_and(|la| r.known_index.is_some_and(|k| la > k)))
+            })
             .collect();
 
         // Sort by stable_latency descending for worst_stale
@@ -481,7 +497,7 @@ impl SetFullChecker {
 
 /// Compute a percentile from a slice of values.
 fn percentile(values: &[u64], p: f64) -> Option<u64> {
-    if values.is_empty() {
+    if values.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
         return None;
     }
     let mut sorted: Vec<u64> = values.to_vec();
@@ -904,7 +920,8 @@ mod tests {
 
         // Read that misses all (creating absent records)
         history.push(Op::read_invoke(6, 10u64).at(Timestamp::from_millis(6)));
-        history.push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Timestamp::from_millis(7)));
+        history
+            .push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Timestamp::from_millis(7)));
 
         // Read that sees all (making them stable)
         history.push(Op::read_invoke(8, 10u64).at(Timestamp::from_millis(8)));
@@ -1008,6 +1025,80 @@ mod tests {
         // Should work correctly - element is stable
         assert_eq!(result.stable_count, 1);
         assert_eq!(result.valid, Validity::Valid);
+    }
+
+    // ====== Bug fix regression tests ======
+
+    #[test]
+    fn test_percentile_invalid_p_returns_none() {
+        let values = vec![1, 2, 3, 4, 5];
+
+        // Valid p values should work
+        assert!(percentile(&values, 0.0).is_some());
+        assert!(percentile(&values, 0.5).is_some());
+        assert!(percentile(&values, 1.0).is_some());
+
+        // Invalid p values should return None
+        assert!(percentile(&values, -0.1).is_none());
+        assert!(percentile(&values, 1.1).is_none());
+        assert!(percentile(&values, 2.0).is_none());
+        assert!(percentile(&values, f64::NAN).is_none());
+        assert!(percentile(&values, f64::INFINITY).is_none());
+        assert!(percentile(&values, f64::NEG_INFINITY).is_none());
+
+        // Empty values should still return None
+        assert!(percentile(&[], 0.5).is_none());
+    }
+
+    #[test]
+    fn test_linearizable_stale_detection_without_timestamps() {
+        // Test that stale elements are detected even without timestamps,
+        // using index-based ordering as fallback
+        let mut history = History::new();
+
+        // Add element without timestamps
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_ok(1, 0u64, 1));
+
+        // Read after add completes that misses the element (no timestamps)
+        history.push(Op::read_invoke(2, 1u64));
+        history.push(Op::read_ok(3, 1u64, std::iter::empty::<i32>()));
+
+        // Later read that sees the element
+        history.push(Op::read_invoke(4, 1u64));
+        history.push(Op::read_ok(5, 1u64, [1]));
+
+        // In eventual consistency mode, this is valid (stale but not a violation)
+        let eventual_result = SetFullChecker::default().check(&history);
+        assert_eq!(eventual_result.valid, Validity::Valid);
+        assert_eq!(eventual_result.stale_count, 1);
+
+        // In linearizable mode, stale elements cause failure
+        let linearizable_result = SetFullChecker::linearizable().check(&history);
+        assert_eq!(linearizable_result.valid, Validity::Invalid);
+        assert_eq!(linearizable_result.stale_count, 1);
+
+        // Verify the element is detected as stale via index ordering
+        // (stable_latency_ms is None because no timestamps, but last_absent_index > known_index)
+        assert!(linearizable_result.stale.contains(&1));
+    }
+
+    #[test]
+    fn test_linearizable_no_false_stale_without_timestamps() {
+        // Ensure we don't falsely detect staleness when element appears immediately
+        let mut history = History::new();
+
+        // Add element without timestamps
+        history.push(Op::add_invoke(0, 0u64, 1));
+        history.push(Op::add_ok(1, 0u64, 1));
+
+        // First read after add sees the element (no staleness)
+        history.push(Op::read_invoke(2, 1u64));
+        history.push(Op::read_ok(3, 1u64, [1]));
+
+        let linearizable_result = SetFullChecker::linearizable().check(&history);
+        assert_eq!(linearizable_result.valid, Validity::Valid);
+        assert_eq!(linearizable_result.stale_count, 0);
     }
 
     // ====== Stress tests ======
