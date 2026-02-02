@@ -7,17 +7,17 @@
 //! # Quick Start
 //!
 //! ```
-//! use spectroscope::{History, Op, SetFullChecker, Validity};
+//! use spectroscope::{History, Op, Pid, SetFullChecker, Validity};
 //!
 //! let mut history = History::new();
 //!
 //! // Process 0 adds element 1
-//! history.push(Op::add_invoke(0, 0u64, 1));
-//! history.push(Op::add_ok(1, 0u64, 1));
+//! history.push(Op::add_invoke(0, Pid(0), 1).at_millis(0));
+//! history.push(Op::add_ok(1, Pid(0), 1).at_millis(5));
 //!
 //! // Process 1 reads and sees it
-//! history.push(Op::read_invoke(2, 1u64));
-//! history.push(Op::read_ok(3, 1u64, [1]));
+//! history.push(Op::read_invoke(2, Pid(1)).at_millis(10));
+//! history.push(Op::read_ok(3, Pid(1), [1]).at_millis(12));
 //!
 //! let result = SetFullChecker::default().check(&history);
 //! assert_eq!(result.valid, Validity::Valid);
