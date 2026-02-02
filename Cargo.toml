@@ -1,0 +1,19 @@
+[package]
+name = "spectroscope"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "EPL-1.0"
+description = "Consistency and isolation level checkers for distributed systems testing"
+repository = "https://github.com/pcholakov/spectroscope"
+documentation = "https://docs.rs/spectroscope"
+readme = "README.md"
+keywords = ["distributed-systems", "testing", "linearizability", "consistency"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+ahash = "0.8"
+
+[dev-dependencies]
+proptest = "1.5"
+rand = "0.9"
