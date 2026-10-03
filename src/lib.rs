@@ -45,12 +45,16 @@
 //! [`PrecedenceCycle`] proving it. Duplicates, and elements read without any add,
 //! make a history invalid without a cycle.
 
+mod graph;
 pub mod history;
 pub mod list_append;
 pub mod set_full;
 
 pub use history::{History, HistoryError, Op, OpType, Operation, Pid, Timestamp};
-pub use list_append::{Anomaly, ListAppendChecker, ListAppendResult, MicroOp, Txn, TxnRef};
+pub use list_append::{
+    Anomaly, ConsistencyModel, Cycle, Dependency, ListAppendChecker, ListAppendResult, MicroOp,
+    Step, Txn, TxnRef,
+};
 pub use set_full::{
     ElementOutcome, Event, Precedence, PrecedenceCycle, Reason, SetFullChecker, SetFullOptions,
     SetFullResult, SetOp, WorstStaleEntry,

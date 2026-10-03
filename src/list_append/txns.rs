@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::{MicroOp, Txn, TxnRef};
-use crate::history::{History, OpType};
+use crate::history::{History, OpType, Pid};
 
 /// Whether a transaction's effects took place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub(super) enum Outcome {
 #[derive(Debug)]
 pub(super) struct TxnRecord<'a, K, V> {
     pub(super) reference: TxnRef,
+    pub(super) process: Pid,
     pub(super) outcome: Outcome,
     /// The completion's micro-operations when committed, so reads carry lists;
     /// otherwise the invocation's.
@@ -140,6 +141,7 @@ fn records<K, V>(history: &History<Txn<K, V>>) -> Vec<TxnRecord<'_, K, V>> {
                     invoke_index: invocation.index,
                     complete_index: completion.map(|c| c.index),
                 },
+                process: invocation.process,
                 outcome,
                 micro_ops,
             }

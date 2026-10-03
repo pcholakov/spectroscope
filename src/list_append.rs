@@ -17,16 +17,19 @@
 //! <https://github.com/jepsen-io/elle>). Anomalies keep Elle's names so results
 //! can be compared.
 //!
-//! [`ListAppendChecker`] currently reports the anomalies visible without a
-//! dependency graph; see [`Anomaly`].
+//! [`ListAppendChecker`] reports two kinds of evidence: anomalies visible
+//! without a dependency graph (see [`Anomaly`]), and cycles in the dependency
+//! graph that rule out the chosen [`ConsistencyModel`] (see [`Cycle`]).
 
 use crate::Validity;
 use crate::history::{History, Op, OpType, Operation, Pid};
 
 mod anomaly;
+mod dependency;
 mod txns;
 
 pub use anomaly::{Anomaly, Expected};
+pub use dependency::{ConsistencyModel, Cycle, Dependency, Step};
 
 /// One step of a list-append transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,27 +159,40 @@ pub struct TxnRef {
     pub complete_index: Option<usize>,
 }
 
-/// Checks list-append histories for the anomalies in [`Anomaly`].
+/// Checks list-append histories against a [`ConsistencyModel`].
 #[derive(Debug, Clone, Copy)]
-pub struct ListAppendChecker;
+pub struct ListAppendChecker {
+    /// The model histories must satisfy.
+    pub model: ConsistencyModel,
+}
 
 /// The outcome of [`ListAppendChecker::check`].
 #[derive(Debug, Clone)]
 pub struct ListAppendResult<K, V> {
     /// `Unknown` if any value was appended to a key twice, since reads can then
-    /// no longer be attributed to one writer. Otherwise `Invalid` if any other
-    /// anomaly was found, and `Unknown` if none was: the absence of these
-    /// anomalies alone does not establish any isolation level.
+    /// no longer be attributed to one writer. Otherwise `Invalid` if there is
+    /// any anomaly or cycle, and `Valid` if there is neither.
     pub valid: Validity,
     /// Every anomaly found, grouped by kind in the order of [`Anomaly`]'s
     /// variants. Within a kind, in history order, or key order for per-key kinds.
     pub anomalies: Vec<Anomaly<K, V>>,
+    /// One shortest cycle per strongly connected component of the dependency
+    /// graph under the checker's model, through the component's
+    /// earliest-invoked transaction, in that transaction's order.
+    pub cycles: Vec<Cycle<K, V>>,
 }
 
 impl ListAppendChecker {
-    /// Check `history` for anomalies.
+    /// A checker for `model`.
+    #[must_use]
+    pub fn new(model: ConsistencyModel) -> Self {
+        Self { model }
+    }
+
+    /// Check `history`.
     ///
-    /// Cost: O(n log n) in the total number of micro-operations and read values.
+    /// Cost: O(n log n) in the number of micro-operations and read values, plus
+    /// one breadth-first search per strongly connected component.
     #[must_use]
     pub fn check<K, V>(&self, history: &History<Txn<K, V>>) -> ListAppendResult<K, V>
     where
@@ -185,15 +201,22 @@ impl ListAppendChecker {
     {
         let txns = txns::Txns::new(history);
         let anomalies = anomaly::find(&txns);
+        let cycles = dependency::cycles(&txns, self.model);
         let unusable = anomalies
             .iter()
             .any(|anomaly| matches!(anomaly, Anomaly::DuplicateAppends { .. }));
-        let valid = if !unusable && !anomalies.is_empty() {
-            Validity::Invalid
-        } else {
+        let valid = if unusable {
             Validity::Unknown
+        } else if anomalies.is_empty() && cycles.is_empty() {
+            Validity::Valid
+        } else {
+            Validity::Invalid
         };
-        ListAppendResult { valid, anomalies }
+        ListAppendResult {
+            valid,
+            anomalies,
+            cycles,
+        }
     }
 }
 
@@ -259,7 +282,11 @@ mod tests {
         }
 
         fn check(self) -> ListAppendResult<&'static str, u32> {
-            ListAppendChecker.check(&History::from_ops(self.ops).unwrap())
+            self.check_against(ConsistencyModel::StrictSerializable)
+        }
+
+        fn check_against(self, model: ConsistencyModel) -> ListAppendResult<&'static str, u32> {
+            ListAppendChecker::new(model).check(&History::from_ops(self.ops).unwrap())
         }
     }
 
@@ -292,9 +319,151 @@ mod tests {
         );
         b.committed(3, &[read_result("z", &[])]);
         b.committed(3, &[read_result("x", &[1, 2, 3])]);
+        // An append that no read observed and that may not have happened, and a
+        // failed append, read as absent afterwards.
+        b.uncommitted(4, OpType::Info, &[append("v", 1)]);
+        b.uncommitted(5, OpType::Fail, &[append("u", 1)]);
+        b.committed(6, &[read_result("v", &[]), read_result("u", &[])]);
         let result = b.check();
         assert_eq!(result.anomalies, []);
-        assert_eq!(result.valid, Validity::Unknown);
+        assert_eq!(result.cycles, []);
+        assert_eq!(result.valid, Validity::Valid);
+    }
+
+    fn ww(
+        from: TxnRef,
+        to: TxnRef,
+        key: &'static str,
+        previous: u32,
+        appended: u32,
+    ) -> Step<&'static str, u32> {
+        let dependency = Dependency::WriteWrite {
+            key,
+            previous,
+            appended,
+        };
+        Step {
+            from,
+            to,
+            dependency,
+        }
+    }
+
+    fn rw(
+        from: TxnRef,
+        to: TxnRef,
+        key: &'static str,
+        read: Option<u32>,
+        appended: u32,
+    ) -> Step<&'static str, u32> {
+        let dependency = Dependency::ReadWrite {
+            key,
+            read,
+            appended,
+        };
+        Step {
+            from,
+            to,
+            dependency,
+        }
+    }
+
+    fn assert_single_cycle(
+        result: &ListAppendResult<&'static str, u32>,
+        steps: Vec<Step<&'static str, u32>>,
+    ) {
+        assert_eq!(result.anomalies, []);
+        assert_eq!(result.cycles, [Cycle { steps }]);
+        assert_eq!(result.valid, Validity::Invalid);
+    }
+
+    /// Reads show T0 then T1 appended to x, but T1 then T0 appended to y.
+    #[test]
+    fn test_write_write_cycle() {
+        let mut b = Builder::default();
+        let t0 = b.committed(0, &[append("x", 1), append("y", 2)]);
+        let t1 = b.committed(1, &[append("x", 3), append("y", 4)]);
+        b.committed(2, &[read_result("x", &[1, 3])]);
+        b.committed(3, &[read_result("y", &[4, 2])]);
+        let steps = vec![ww(t0, t1, "x", 1, 3), ww(t1, t0, "y", 4, 2)];
+        assert_single_cycle(&b.check_against(ConsistencyModel::Serializable), steps);
+    }
+
+    /// Write skew: each transaction read the empty list the other appended to.
+    #[test]
+    fn test_read_write_cycle() {
+        let mut b = Builder::default();
+        let t0 = b.committed(0, &[read_result("x", &[]), append("y", 1)]);
+        let t1 = b.committed(1, &[read_result("y", &[]), append("x", 2)]);
+        let steps = vec![rw(t0, t1, "x", None, 2), rw(t1, t0, "y", None, 1)];
+        assert_single_cycle(&b.check_against(ConsistencyModel::Serializable), steps);
+    }
+
+    /// A read invoked after an append completed misses it: serializable with the
+    /// read first, but not once real-time or process order counts.
+    #[test]
+    fn test_stale_read_cycles_only_under_real_time_or_process_order() {
+        let stale_read = |reader_process: u64| {
+            let mut b = Builder::default();
+            let writer = b.committed(0, &[append("x", 1)]);
+            let reader = b.committed(reader_process, &[read_result("x", &[])]);
+            (b, writer, reader)
+        };
+
+        let (b, _, _) = stale_read(1);
+        assert_eq!(
+            b.check_against(ConsistencyModel::Serializable).valid,
+            Validity::Valid
+        );
+        let (b, _, _) = stale_read(1);
+        let result = b.check_against(ConsistencyModel::StrongSessionSerializable);
+        assert_eq!(result.valid, Validity::Valid);
+
+        let (b, writer, reader) = stale_read(1);
+        let real_time = Step {
+            from: writer,
+            to: reader,
+            dependency: Dependency::RealTime {
+                completed_index: 1,
+                invoked_index: 2,
+            },
+        };
+        let steps = vec![real_time, rw(reader, writer, "x", None, 1)];
+        assert_single_cycle(
+            &b.check_against(ConsistencyModel::StrictSerializable),
+            steps,
+        );
+
+        let (b, writer, reader) = stale_read(0);
+        let process = Step {
+            from: writer,
+            to: reader,
+            dependency: Dependency::Process,
+        };
+        let steps = vec![process, rw(reader, writer, "x", None, 1)];
+        let result = b.check_against(ConsistencyModel::StrongSessionSerializable);
+        assert_single_cycle(&result, steps);
+    }
+
+    /// An append no read observed still follows every observed value, so a read
+    /// that misses it after it completed is stale.
+    #[test]
+    fn test_stale_read_of_unobserved_append() {
+        let mut b = Builder::default();
+        b.committed(0, &[append("x", 1)]);
+        b.committed(1, &[read_result("x", &[1])]);
+        let writer = b.committed(0, &[append("x", 2)]);
+        let reader = b.committed(2, &[read_result("x", &[1])]);
+        let real_time = Step {
+            from: writer,
+            to: reader,
+            dependency: Dependency::RealTime {
+                completed_index: 5,
+                invoked_index: 6,
+            },
+        };
+        let steps = vec![real_time, rw(reader, writer, "x", Some(1), 2)];
+        assert_single_cycle(&b.check(), steps);
     }
 
     #[test]

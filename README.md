@@ -5,7 +5,7 @@ Consistency checkers for distributed systems testing.
 Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. It provides:
 
 - a set checker that ports [Jepsen](https://github.com/jepsen-io/jepsen)'s set-full workload checker and adds an exact linearizability mode;
-- a list-append transaction checker modelled on [Elle](https://github.com/jepsen-io/elle) (Kingsbury and Alvaro, ["Elle: Inferring Isolation Anomalies from Experimental Observations"](https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf), VLDB 2020), working towards strict serializability checking.
+- a list-append transaction checker modelled on [Elle](https://github.com/jepsen-io/elle) (Kingsbury and Alvaro, ["Elle: Inferring Isolation Anomalies from Experimental Observations"](https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf), VLDB 2020), for serializability, strong session serializability and strict serializability.
 
 ## Installation
 
@@ -99,15 +99,23 @@ Transactions append unique values to per-key lists and read whole lists, so each
 reveals the order in which the writes it saw were applied. A system without a native
 append can emulate one with a read and a write of the extended list in one transaction.
 
-`ListAppendChecker` reports the anomalies visible without a dependency graph, using
-Elle's names so results can be compared: `duplicate-appends`, `duplicate-elements`,
-`incompatible-order`, `internal`, `future-read`, `G1a`, `G1b`, `dirty-update` and
-`lost-update`, plus `garbage-read` (a read of a value nothing appended), which Elle does
-not report. Cycle detection for serializability and its real-time variants is not
-implemented yet, so a history without these anomalies is reported as `Unknown`.
+`ListAppendChecker` checks a history against a `ConsistencyModel` and reports two kinds
+of evidence, using Elle's names and definitions so results can be compared:
+
+- **Anomalies visible without a dependency graph:** `duplicate-appends`,
+  `duplicate-elements`, `incompatible-order`, `internal`, `future-read`, `G1a`, `G1b`,
+  `dirty-update` and `lost-update`, plus `garbage-read` (a read of a value nothing
+  appended), which Elle does not report.
+- **Cycles in the dependency graph:** write-write, write-read and read-write
+  dependencies inferred from the lists reads returned, plus process order for strong
+  session serializability or real-time order for strict serializability. Each
+  strongly connected component yields one shortest cycle, with every step explained.
+
+A history with neither is `Valid`. Duplicate appends make it `Unknown`, since reads can
+no longer be attributed to one writer.
 
 ```rust
-use spectroscope::{History, ListAppendChecker, MicroOp, Op, Validity};
+use spectroscope::{ConsistencyModel, History, ListAppendChecker, MicroOp, Op, Validity};
 
 let history = History::from_ops([
     Op::txn_invoke(0, 0u64, [MicroOp::append("x", 1)]),
@@ -115,7 +123,7 @@ let history = History::from_ops([
     Op::txn_invoke(2, 1u64, [MicroOp::read("x")]),
     Op::txn_ok(3, 1u64, [MicroOp::read_result("x", [1, 1])]),
 ])?;
-let result = ListAppendChecker.check(&history);
+let result = ListAppendChecker::new(ConsistencyModel::StrictSerializable).check(&history);
 assert_eq!(result.valid, Validity::Invalid);
 assert_eq!(result.anomalies[0].name(), "duplicate-elements");
 ```
