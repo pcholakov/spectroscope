@@ -268,6 +268,14 @@ mod tests {
             index
         }
 
+        /// A transaction that never completes.
+        fn pending(&mut self, process: u64, appends: &[TestOp]) -> TxnRef {
+            TxnRef {
+                invoke_index: self.invoke(process, appends),
+                complete_index: None,
+            }
+        }
+
         fn committed(&mut self, process: u64, micro_ops: &[TestOp]) -> TxnRef {
             let invoke_index = self.invoke(process, micro_ops);
             let complete_index = self.ops.len();
@@ -536,6 +544,18 @@ mod tests {
         assert_single_cycle(&b.check(), "G-single-item-realtime", &steps);
     }
 
+    /// A pending transaction may have committed, but then all of it did: a read
+    /// cannot see one of its appends and miss the other.
+    #[test]
+    fn test_pending_transaction_is_atomic() {
+        let mut b = Builder::default();
+        let writer = b.pending(0, &[append("x", 1), append("y", 2)]);
+        let reader = b.committed(1, &[read_result("x", &[1]), read_result("y", &[])]);
+        let steps = vec![wr(writer, reader, "x", 1), rw(reader, writer, "y", None, 2)];
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G-single-item", &steps);
+    }
+
     /// An append no read observed still follows every observed value, so a read
     /// that misses it after it completed is stale.
     #[test]
@@ -716,6 +736,42 @@ mod tests {
         assert_eq!(result.cycles.len(), 1);
         assert_eq!(result.cycles[0].anomaly.name(), "G2-item");
         assert_eq!(result.cycles[0].steps, steps);
+    }
+
+    /// Reads show a transaction's appends out of its own order, or a later one
+    /// without the earlier one.
+    #[test]
+    fn test_append_order() {
+        let mut b = Builder::default();
+        let txn = b.committed(0, &[append("x", 1), append("x", 2)]);
+        let reader = b.committed(1, &[read_result("x", &[2, 1])]);
+        let expected = [
+            // The out-of-order read also ends on the intermediate value.
+            Anomaly::G1b {
+                reader,
+                writer: txn,
+                key: "x",
+                value: 1,
+            },
+            Anomaly::AppendOrder {
+                txn,
+                key: "x",
+                appended: vec![1, 2],
+                observed: vec![2, 1],
+            },
+        ];
+        assert_invalid(&b.check(), &expected);
+
+        let mut b = Builder::default();
+        let txn = b.committed(0, &[append("x", 1), append("x", 2)]);
+        b.committed(1, &[read_result("x", &[2])]);
+        let expected = Anomaly::AppendOrder {
+            txn,
+            key: "x",
+            appended: vec![1, 2],
+            observed: vec![2],
+        };
+        assert_invalid(&b.check(), &[expected]);
     }
 
     #[test]

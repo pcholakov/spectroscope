@@ -39,8 +39,10 @@ use super::{MicroOp, TxnRef};
 use crate::graph::{Cost, Digraph, PathEdge};
 use crate::history::Pid;
 
-/// A consistency model the checker can verify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A consistency model the checker can verify. Variants are ordered from
+/// weakest to strongest; each allows a subset of the histories the previous
+/// one allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConsistencyModel {
     /// Transactions appear to execute in some total order consistent with
     /// write-write, write-read and read-write dependencies.

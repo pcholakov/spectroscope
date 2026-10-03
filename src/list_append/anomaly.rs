@@ -4,7 +4,8 @@
 //!
 //! Names and definitions follow Elle's list-append checker
 //! (<https://github.com/jepsen-io/elle>, `elle.list-append`), so results can be
-//! compared with Elle's. `garbage-read` is this crate's addition.
+//! compared with Elle's. `garbage-read` and `append-order` are this crate's
+//! additions.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -126,6 +127,20 @@ pub enum Anomaly<K, V> {
         /// The value nothing appended.
         value: V,
     },
+    /// `append-order` (not in Elle): reads show a transaction's appends to a key
+    /// out of the order it made them, or show one without the appends it made
+    /// to that key before it. A transaction's appends to a key take effect in
+    /// its own order, and a read containing one contains every earlier one.
+    AppendOrder {
+        /// The appending transaction.
+        txn: TxnRef,
+        /// The key.
+        key: K,
+        /// The transaction's values for the key, in the order it appended them.
+        appended: Vec<V>,
+        /// Those of its values the longest read contains, in the read's order.
+        observed: Vec<V>,
+    },
 }
 
 /// What a transaction's own earlier micro-operations imply a read of a key
@@ -154,6 +169,7 @@ impl<K, V> Anomaly<K, V> {
             Self::DirtyUpdate { .. } => "dirty-update",
             Self::LostUpdate { .. } => "lost-update",
             Self::GarbageRead { .. } => "garbage-read",
+            Self::AppendOrder { .. } => "append-order",
         }
     }
 }
@@ -198,6 +214,7 @@ where
     anomalies.extend(provenance);
     anomalies.extend(dirty_updates(txns));
     anomalies.extend(lost_updates(txns));
+    anomalies.extend(append_orders(txns));
     anomalies
 }
 
@@ -451,6 +468,60 @@ fn lost_updates<K: Clone + Ord, V: Clone + Ord>(txns: &Txns<'_, K, V>) -> Vec<An
             txns: group,
         })
         .collect()
+}
+
+/// Compares each transaction's appends to each key with their order in the
+/// key's longest committed read: the values the read contains must be the
+/// transaction's first ones, in the order it appended them.
+fn append_orders<K: Clone + Ord, V: Clone + Ord>(txns: &Txns<'_, K, V>) -> Vec<Anomaly<K, V>> {
+    let mut position: BTreeMap<(&K, &V), usize> = BTreeMap::new();
+    for (key, lists) in &txns.observed_lists {
+        if let Some(&(order, _)) = lists.last() {
+            for (index, value) in order.iter().enumerate() {
+                position.entry((*key, value)).or_insert(index);
+            }
+        }
+    }
+
+    let mut anomalies = Vec::new();
+    for record in &txns.records {
+        if record.outcome == Outcome::Aborted {
+            continue;
+        }
+        let mut appended: BTreeMap<&K, Vec<&V>> = BTreeMap::new();
+        for micro_op in record.micro_ops {
+            if let MicroOp::Append { key, value } = micro_op {
+                appended.entry(key).or_default().push(value);
+            }
+        }
+        for (key, values) in appended {
+            let positions: Vec<Option<usize>> = values
+                .iter()
+                .map(|value| position.get(&(key, *value)).copied())
+                .collect();
+            let observed_count = positions.iter().take_while(|p| p.is_some()).count();
+            let prefix_observed = positions[observed_count..].iter().all(Option::is_none);
+            let in_order = positions[..observed_count]
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]);
+            if prefix_observed && in_order {
+                continue;
+            }
+            let mut observed: Vec<(usize, &V)> = values
+                .iter()
+                .zip(&positions)
+                .filter_map(|(value, p)| p.map(|p| (p, *value)))
+                .collect();
+            observed.sort_unstable();
+            anomalies.push(Anomaly::AppendOrder {
+                txn: record.reference,
+                key: key.clone(),
+                appended: values.into_iter().cloned().collect(),
+                observed: observed.into_iter().map(|(_, v)| v.clone()).collect(),
+            });
+        }
+    }
+    anomalies
 }
 
 /// The committed reads of a transaction, as (key, list) pairs.

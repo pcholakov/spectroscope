@@ -104,8 +104,9 @@ of evidence, using Elle's names and definitions so results can be compared:
 
 - **Anomalies visible without a dependency graph:** `duplicate-appends`,
   `duplicate-elements`, `incompatible-order`, `internal`, `future-read`, `G1a`, `G1b`,
-  `dirty-update` and `lost-update`, plus `garbage-read` (a read of a value nothing
-  appended), which Elle does not report.
+  `dirty-update` and `lost-update`. Two more are not in Elle: `garbage-read`, a read of
+  a value nothing appended, and `append-order`, reads that show a transaction's appends
+  to a key out of its own order or without its earlier appends.
 - **Cycles in the dependency graph:** write-write, write-read and read-write
   dependencies inferred from the lists reads returned, plus process order for strong
   session serializability or real-time order for strict serializability. Each
@@ -131,6 +132,23 @@ let result = ListAppendChecker::new(ConsistencyModel::StrictSerializable).check(
 assert_eq!(result.valid, Validity::Invalid);
 assert_eq!(result.anomalies[0].name(), "duplicate-elements");
 ```
+
+### Validation
+
+`tests/list_append_oracle.rs` compares the checker's verdict for each model with a
+brute-force oracle. The oracle searches every serial order of every allowed subset of
+indeterminate transactions, respecting the model's ordering constraints. The two agree
+on 40,000 random histories of up to 6 transactions over up to 3 keys. The histories
+come from simulated stores at serial, snapshot, read-committed and read-uncommitted
+isolation, with failures, crashes, transactions that commit after their client gave
+up, pending transactions, stale reads and corrupted reads. The test also asserts that
+every anomaly and cycle class occurs, that histories invalid only through a cycle occur
+under every model, and that reads of indeterminate transactions' appends occur. This is
+a bounded result, not a proof.
+
+Simulated strictly serializable histories of 500 transactions are also checked, and a
+100,000-transaction history takes about 0.7 s in a release build. The dependency graph
+stays linear in the history's size.
 
 ## License
 
