@@ -72,6 +72,7 @@ pub struct Op<V> {
 }
 
 impl<V> Op<V> {
+    /// Create an op without a timestamp; see [`Op::at`].
     #[must_use]
     pub fn new(index: usize, process: impl Into<Pid>, op_type: OpType, value: V) -> Self {
         Self {
@@ -110,33 +111,61 @@ pub trait Operation {
 
 /// Why an operation cannot be appended to a [`History`].
 ///
-/// Indices refer to [`Op::index`].
+/// Each variant's `index` is the rejected op's [`Op::index`]; every other index
+/// names an earlier op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryError {
     /// The op's index does not exceed the preceding op's index.
-    IndexNotIncreasing { index: usize, previous: usize },
-    /// The op's timestamp is earlier than a preceding op's timestamp.
-    TimeDecreasing { index: usize },
-    /// The invocation's value is malformed, per [`Operation::is_valid_invocation`].
-    InvalidInvocation { index: usize },
-    /// The process invoked an op while its op at `outstanding` had not completed.
-    ConcurrentInvoke {
+    IndexNotIncreasing {
+        /// The rejected op.
         index: usize,
+        /// The preceding op.
+        previous: usize,
+    },
+    /// The op's timestamp is earlier than a preceding op's timestamp.
+    TimeDecreasing {
+        /// The rejected op.
+        index: usize,
+    },
+    /// The invocation's value is malformed, per [`Operation::is_valid_invocation`].
+    InvalidInvocation {
+        /// The rejected op.
+        index: usize,
+    },
+    /// The process invoked an op while an earlier op of its own had not completed.
+    ConcurrentInvoke {
+        /// The rejected op.
+        index: usize,
+        /// The invoking process.
         process: Pid,
+        /// The process's outstanding invocation.
         outstanding: usize,
     },
-    /// The process invoked an op after its op at `crashed_at` completed with
+    /// The process invoked an op after one of its ops completed with
     /// [`OpType::Info`]. A crashed process must continue under a new [`Pid`].
     InvokeAfterCrash {
+        /// The rejected op.
         index: usize,
+        /// The crashed process.
         process: Pid,
+        /// The `Info` completion that crashed the process.
         crashed_at: usize,
     },
     /// The process has no outstanding invocation for this completion.
-    UnmatchedCompletion { index: usize, process: Pid },
+    UnmatchedCompletion {
+        /// The rejected op.
+        index: usize,
+        /// The completing process.
+        process: Pid,
+    },
     /// The completion's value does not complete its invocation's, per
     /// [`Operation::is_valid_completion`].
-    CompletionMismatch { index: usize, invocation: usize },
+    CompletionMismatch {
+        /// The rejected op.
+        index: usize,
+        /// The invocation it was paired with.
+        invocation: usize,
+    },
 }
 
 impl std::fmt::Display for HistoryError {
@@ -204,6 +233,7 @@ pub struct History<V> {
 }
 
 impl<V> History<V> {
+    /// Create an empty history.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -215,16 +245,19 @@ impl<V> History<V> {
         }
     }
 
+    /// All ops, in the order they were pushed.
     #[must_use]
     pub fn ops(&self) -> &[Op<V>] {
         &self.ops
     }
 
+    /// Number of ops, counting invocations and completions separately.
     #[must_use]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
+    /// Whether the history has no ops.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
@@ -255,6 +288,10 @@ impl<V> History<V> {
 
 impl<V: Operation> History<V> {
     /// Build a history from ops in real-time order.
+    ///
+    /// # Errors
+    ///
+    /// The first op that [`History::push`] rejects.
     pub fn from_ops(ops: impl IntoIterator<Item = Op<V>>) -> Result<Self, HistoryError> {
         let mut history = Self::new();
         for op in ops {
@@ -263,7 +300,12 @@ impl<V: Operation> History<V> {
         Ok(history)
     }
 
-    /// Append the next op in real-time order. On error the history is unchanged.
+    /// Append the next op in real-time order.
+    ///
+    /// # Errors
+    ///
+    /// A [`HistoryError`] when `op` would break one of the invariants above. The
+    /// history is then unchanged.
     pub fn push(&mut self, op: Op<V>) -> Result<(), HistoryError> {
         let index = op.index;
         if let Some(previous) = self.ops.last()
@@ -358,8 +400,8 @@ mod tests {
 
     #[test]
     fn test_rejects_malformed_ops() {
-        let p0 = Pid(0);
         type Ops = Vec<Op<SetOp<i32>>>;
+        let p0 = Pid(0);
         let cases: Vec<(&str, Ops, HistoryError)> = vec![
             (
                 "index not increasing",

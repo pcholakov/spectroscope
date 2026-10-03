@@ -31,7 +31,9 @@ pub enum Event<T> {
     Add(T),
     /// A successful read, identified by its invocation and completion indices.
     Read {
+        /// Index of the read's invocation.
         invoke_index: usize,
+        /// Index of the read's successful completion.
         complete_index: usize,
     },
 }
@@ -43,7 +45,9 @@ pub enum Reason {
     /// (at `invoked_index`). For an add, these are its earliest `Ok` completion
     /// and its earliest non-failed invocation.
     RealTime {
+        /// Index of the op at which `before` completed.
         completed_index: usize,
+        /// Index of the op at which `after` was invoked.
         invoked_index: usize,
     },
     /// `after` is a read that returned `before`'s element.
@@ -55,8 +59,11 @@ pub enum Reason {
 /// A required ordering between two events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Precedence<T> {
+    /// The event that must take effect first.
     pub before: Event<T>,
+    /// The event that must take effect second.
     pub after: Event<T>,
+    /// What in the history forces the order.
     pub reason: Reason,
 }
 
@@ -66,6 +73,7 @@ pub struct Precedence<T> {
 /// is the first edge's `before`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecedenceCycle<T> {
+    /// The orderings, in cycle order.
     pub edges: Vec<Precedence<T>>,
 }
 
@@ -157,6 +165,7 @@ where
                     let mut state: Vec<&T> = returned.iter().collect();
                     state.sort_unstable();
                     state.dedup();
+                    #[allow(clippy::expect_used, reason = "History pairs every completion")]
                     let invocation = history
                         .invocation(pos)
                         .expect("History pairs every completion with its invocation");

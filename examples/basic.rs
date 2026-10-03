@@ -80,7 +80,11 @@ fn main() -> Result<(), HistoryError> {
     let divergent_result = SetFullChecker::linearizable().check(&divergent);
 
     println!("Validity: {:?}", divergent_result.valid);
-    for edge in &divergent_result.linearizability_violation.unwrap().edges {
+    let edges = divergent_result
+        .linearizability_violation
+        .iter()
+        .flat_map(|cycle| &cycle.edges);
+    for edge in edges {
         println!(
             "{:?} before {:?} ({:?})",
             edge.before, edge.after, edge.reason

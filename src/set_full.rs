@@ -142,16 +142,20 @@ struct ElementResult<T> {
     last_absent_time: Option<Duration>,
 }
 
-/// Detailed info about a stale element (for worst_stale reporting).
+/// Detailed info about a stale element, for `worst_stale` reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorstStaleEntry<T> {
+    /// The stale element.
     pub element: T,
+    /// Always [`ElementOutcome::Stable`]: only stable elements can be stale.
     pub outcome: ElementOutcome,
-    /// Index and time when the element was first known to exist.
+    /// Index of the op that first showed the element exists.
     pub known_index: usize,
+    /// Time of that op, if it was timestamped.
     pub known_time: Option<Duration>,
-    /// Index and time of the last read that didn't observe the element.
+    /// Invocation index of the last read that didn't return the element.
     pub last_absent_index: Option<usize>,
+    /// Time of that invocation, if it was timestamped.
     pub last_absent_time: Option<Duration>,
     /// Latency in milliseconds until stable.
     pub stable_latency_ms: u64,
@@ -160,13 +164,19 @@ pub struct WorstStaleEntry<T> {
 /// Result of the set-full check.
 #[derive(Debug, Clone)]
 pub struct SetFullResult<T> {
+    /// The verdict; see the module docs for what each mode requires.
     pub valid: Validity,
     /// Distinct elements that were added or observed.
     pub attempt_count: usize,
+    /// Number of elements in the [`ElementOutcome::Stable`] outcome.
     pub stable_count: usize,
+    /// Length of `lost`.
     pub lost_count: usize,
+    /// Length of `never_read`.
     pub never_read_count: usize,
+    /// Length of `stale`.
     pub stale_count: usize,
+    /// Number of entries in `duplicated`.
     pub duplicated_count: usize,
     /// Elements that were lost.
     pub lost: Vec<T>,
@@ -325,9 +335,7 @@ impl<T: Clone> ElementState<T> {
                 Some(Duration::ZERO)
             };
             match (stable_time, known_time) {
-                (Some(st), Some(kt)) => {
-                    Some(st.saturating_sub(kt.as_duration()).as_millis() as u64)
-                }
+                (Some(st), Some(kt)) => Some(whole_millis(st.saturating_sub(kt.as_duration()))),
                 _ => None, // Unknown latency when timestamps missing
             }
         } else {
@@ -341,9 +349,7 @@ impl<T: Clone> ElementState<T> {
                 Some(Duration::ZERO)
             };
             match (lost_time, known_time) {
-                (Some(lt), Some(kt)) => {
-                    Some(lt.saturating_sub(kt.as_duration()).as_millis() as u64)
-                }
+                (Some(lt), Some(kt)) => Some(whole_millis(lt.saturating_sub(kt.as_duration()))),
                 _ => None, // Unknown latency when timestamps missing
             }
         } else {
@@ -372,93 +378,39 @@ impl<T: Clone> ElementState<T> {
 /// The set-full checker.
 #[derive(Debug, Clone, Default)]
 pub struct SetFullChecker {
+    /// What the checker requires of a history.
     pub options: SetFullOptions,
 }
 
 impl SetFullChecker {
+    /// Create a checker with the given options.
     #[must_use]
     pub fn new(options: SetFullOptions) -> Self {
         Self { options }
     }
 
+    /// Create a checker that also requires the history to be linearizable.
     #[must_use]
     pub fn linearizable() -> Self {
         Self::new(SetFullOptions { linearizable: true })
     }
 
     /// Check a history for set consistency.
+    ///
+    /// # Panics
+    ///
+    /// Only if [`History`] breaks its invariant that every completion is paired
+    /// with an invocation, which would be a bug in this crate.
     #[must_use]
     pub fn check<T>(&self, history: &History<SetOp<T>>) -> SetFullResult<T>
     where
         T: Clone + Eq + Hash + Ord,
     {
-        let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
-        let mut duplicates: HashMap<T, usize> = HashMap::new();
-        // Elements with an add that did not fail.
-        let mut attempted: HashSet<T> = HashSet::new();
-
-        for (pos, op) in history.ops().iter().enumerate() {
-            match (&op.value, op.op_type) {
-                (SetOp::Add(element), OpType::Invoke) => {
-                    elements
-                        .entry(element.clone())
-                        .or_insert_with(|| ElementState::new(element.clone()));
-                    let outcome = history.completion(pos).map(|c| c.op_type);
-                    if outcome != Some(OpType::Fail) {
-                        attempted.insert(element.clone());
-                    }
-                }
-                (SetOp::Add(element), OpType::Ok) => {
-                    if let Some(state) = elements.get_mut(element) {
-                        state.on_add_ok(op);
-                    }
-                }
-                (SetOp::Read(Some(returned)), OpType::Ok) => {
-                    let inv = history
-                        .invocation(pos)
-                        .expect("History pairs every completion with its invocation");
-
-                    let mut freqs: HashMap<T, usize> = HashMap::new();
-                    for elem in returned {
-                        *freqs.entry(elem.clone()).or_insert(0) += 1;
-                    }
-                    // Track max multiplicity for elements returned more than once
-                    for (elem, count) in &freqs {
-                        if *count > 1 {
-                            duplicates
-                                .entry(elem.clone())
-                                .and_modify(|c| *c = (*c).max(*count))
-                                .or_insert(*count);
-                        }
-                    }
-                    let read_set: HashSet<T> = freqs.into_keys().collect();
-
-                    // Track elements discovered in reads (not previously added)
-                    for elem in &read_set {
-                        if !elements.contains_key(elem) {
-                            let mut state = ElementState::new(elem.clone());
-                            // Element is known from this read
-                            state.known = Some(OpRef {
-                                index: op.index,
-                                time: op.time,
-                            });
-                            state.on_read_present(inv, op);
-                            elements.insert(elem.clone(), state);
-                        }
-                    }
-
-                    // Update all tracked elements
-                    for (elem, state) in elements.iter_mut() {
-                        if read_set.contains(elem) {
-                            state.on_read_present(inv, op);
-                        } else {
-                            state.on_read_absent(inv);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let Observations {
+            elements,
+            duplicates,
+            attempted,
+        } = Observations::replay(history);
 
         let mut observed_without_add: Vec<T> = elements
             .values()
@@ -469,7 +421,7 @@ impl SetFullChecker {
 
         let mut results: Vec<ElementResult<T>> = elements
             .into_values()
-            .map(|state| state.into_result())
+            .map(ElementState::into_result)
             .collect();
         results.sort_by(|a, b| a.element.cmp(&b.element));
 
@@ -499,40 +451,7 @@ impl SetFullChecker {
             }
         }
 
-        // A stale element was missed by a read invoked after it was known. History
-        // timestamps never decrease, so this covers every non-zero stable latency.
-        let mut stale_results: Vec<&ElementResult<T>> = results
-            .iter()
-            .filter(|r| {
-                r.outcome == ElementOutcome::Stable
-                    && r.last_absent_index
-                        .is_some_and(|la| r.known_index.is_some_and(|k| la > k))
-            })
-            .collect();
-
-        // Sort by stable_latency descending for worst_stale
-        stale_results.sort_by(|a, b| {
-            b.stable_latency_ms
-                .unwrap_or(0)
-                .cmp(&a.stable_latency_ms.unwrap_or(0))
-        });
-
-        // Top 8 worst stale elements
-        let worst_stale: Vec<WorstStaleEntry<T>> = stale_results
-            .iter()
-            .take(8)
-            .map(|r| WorstStaleEntry {
-                element: r.element.clone(),
-                outcome: r.outcome,
-                known_index: r.known_index.unwrap_or(0),
-                known_time: r.known_time,
-                last_absent_index: r.last_absent_index,
-                last_absent_time: r.last_absent_time,
-                stable_latency_ms: r.stable_latency_ms.unwrap_or(0),
-            })
-            .collect();
-
-        let stale: Vec<T> = stale_results.iter().map(|r| r.element.clone()).collect();
+        let (stale, worst_stale) = rank_stale(&results);
 
         // Every stale or lost element also yields a linearizability violation.
         let linearizability_violation = if self.options.linearizable {
@@ -574,6 +493,134 @@ impl SetFullChecker {
     }
 }
 
+/// What a history's reads and adds revealed about each element, gathered in one
+/// pass in real-time order.
+struct Observations<T> {
+    elements: HashMap<T, ElementState<T>>,
+    /// Elements some read returned more than once, with the largest multiplicity.
+    duplicates: HashMap<T, usize>,
+    /// Elements with an add that did not fail.
+    attempted: HashSet<T>,
+}
+
+impl<T: Clone + Eq + Hash> Observations<T> {
+    /// Order matters: an element becomes known at the earliest add completion or
+    /// read completion that shows it, whichever comes first in the history.
+    fn replay(history: &History<SetOp<T>>) -> Self {
+        let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
+        let mut duplicates: HashMap<T, usize> = HashMap::new();
+        let mut attempted: HashSet<T> = HashSet::new();
+
+        for (pos, op) in history.ops().iter().enumerate() {
+            match (&op.value, op.op_type) {
+                (SetOp::Add(element), OpType::Invoke) => {
+                    elements
+                        .entry(element.clone())
+                        .or_insert_with(|| ElementState::new(element.clone()));
+                    let outcome = history.completion(pos).map(|c| c.op_type);
+                    if outcome != Some(OpType::Fail) {
+                        attempted.insert(element.clone());
+                    }
+                }
+                (SetOp::Add(element), OpType::Ok) => {
+                    if let Some(state) = elements.get_mut(element) {
+                        state.on_add_ok(op);
+                    }
+                }
+                (SetOp::Read(Some(returned)), OpType::Ok) => {
+                    #[allow(clippy::expect_used, reason = "History pairs every completion")]
+                    let inv = history
+                        .invocation(pos)
+                        .expect("History pairs every completion with its invocation");
+
+                    let mut freqs: HashMap<T, usize> = HashMap::new();
+                    for elem in returned {
+                        *freqs.entry(elem.clone()).or_insert(0) += 1;
+                    }
+                    // Track max multiplicity for elements returned more than once
+                    for (elem, count) in &freqs {
+                        if *count > 1 {
+                            duplicates
+                                .entry(elem.clone())
+                                .and_modify(|c| *c = (*c).max(*count))
+                                .or_insert(*count);
+                        }
+                    }
+                    let read_set: HashSet<T> = freqs.into_keys().collect();
+
+                    // Track elements discovered in reads (not previously added)
+                    for elem in &read_set {
+                        if !elements.contains_key(elem) {
+                            let mut state = ElementState::new(elem.clone());
+                            // Element is known from this read
+                            state.known = Some(OpRef {
+                                index: op.index,
+                                time: op.time,
+                            });
+                            state.on_read_present(inv, op);
+                            elements.insert(elem.clone(), state);
+                        }
+                    }
+
+                    // Update all tracked elements
+                    for (elem, state) in &mut elements {
+                        if read_set.contains(elem) {
+                            state.on_read_present(inv, op);
+                        } else {
+                            state.on_read_absent(inv);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            elements,
+            duplicates,
+            attempted,
+        }
+    }
+}
+
+/// Stale elements, in element order, and the eight with the highest stable
+/// latency, worst first.
+fn rank_stale<T: Clone>(results: &[ElementResult<T>]) -> (Vec<T>, Vec<WorstStaleEntry<T>>) {
+    // A stale element was missed by a read invoked after it was known. History
+    // timestamps never decrease, so this covers every non-zero stable latency.
+    let mut stale_results: Vec<&ElementResult<T>> = results
+        .iter()
+        .filter(|r| {
+            r.outcome == ElementOutcome::Stable
+                && r.last_absent_index
+                    .is_some_and(|la| r.known_index.is_some_and(|k| la > k))
+        })
+        .collect();
+    let stale = stale_results.iter().map(|r| r.element.clone()).collect();
+
+    stale_results.sort_by_key(|r| std::cmp::Reverse(r.stable_latency_ms.unwrap_or(0)));
+    let worst_stale = stale_results
+        .iter()
+        .take(8)
+        .map(|r| WorstStaleEntry {
+            element: r.element.clone(),
+            outcome: r.outcome,
+            known_index: r.known_index.unwrap_or(0),
+            known_time: r.known_time,
+            last_absent_index: r.last_absent_index,
+            last_absent_time: r.last_absent_time,
+            stable_latency_ms: r.stable_latency_ms.unwrap_or(0),
+        })
+        .collect();
+    (stale, worst_stale)
+}
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX` (about 585 million
+/// years), which no test history reaches.
+fn whole_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Compute a percentile from a slice of values.
 fn percentile(values: &[u64], p: f64) -> Option<u64> {
     if values.is_empty() || !p.is_finite() || !(0.0..=1.0).contains(&p) {
@@ -581,11 +628,27 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
     }
     let mut sorted: Vec<u64> = values.to_vec();
     sorted.sort_unstable();
+    // `p` is in [0, 1], so the rounded product lies in [0, len - 1]. Converting the
+    // length to f64 is exact below 2^53 elements.
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "bounded by the comment above"
+    )]
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
     Some(sorted[idx])
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "fixtures convert small loop counters between integer types"
+)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1387,7 +1450,7 @@ mod tests {
     fn test_lost_burst_high_interleaving() {
         let mut ops = Vec::new();
         let num_elements = 50;
-        let lost_set: HashSet<i32> = [5, 15, 25, 35, 45].iter().cloned().collect();
+        let lost_set: HashSet<i32> = [5, 15, 25, 35, 45].into_iter().collect();
 
         // Add all elements
         for i in 0..num_elements {
@@ -1879,7 +1942,7 @@ mod tests {
             };
 
             let edges = &cycle.edges;
-            assert!(!edges.is_empty());
+            assert!(!edges.is_empty(), "a cycle needs at least one edge");
             for (i, edge) in edges.iter().enumerate() {
                 assert_eq!(edge.after, edges[(i + 1) % edges.len()].before, "{cycle:?}");
                 for event in [&edge.before, &edge.after] {
