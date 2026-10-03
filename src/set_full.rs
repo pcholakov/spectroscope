@@ -223,9 +223,10 @@ impl<T: Clone> ElementState<T> {
 
     /// Compute the final result for this element.
     fn into_result(self) -> ElementResult<T> {
-        let last_present_idx = self.last_present.as_ref().map_or(-1, |p| p.index as i64);
-        let last_absent_idx = self.last_absent.as_ref().map_or(-1, |a| a.index as i64);
-        let known_idx = self.known.as_ref().map_or(-1, |k| k.index as i64);
+        // `None` orders before every index: no observation precedes any observation.
+        let last_present_idx = self.last_present.as_ref().map(|p| p.index);
+        let last_absent_idx = self.last_absent.as_ref().map(|a| a.index);
+        let known_idx = self.known.as_ref().map(|k| k.index);
 
         // Stable if we have a present observation more recent than any absent observation
         let stable = self.last_present.is_some() && last_present_idx > last_absent_idx;
@@ -1619,6 +1620,28 @@ mod tests {
         );
     }
 
+    /// Indices are arbitrary increasing `usize`s, so outcomes must not depend on
+    /// them fitting in a signed integer.
+    #[test]
+    fn test_indices_above_i64_max() {
+        let b = 1usize << 63;
+        let history = History::from_ops([
+            Op::read_invoke(0, 0u64),
+            Op::add_invoke(1, 1u64, 1),
+            Op::add_ok(b, 1u64, 1),
+            Op::read_invoke(b + 1, 2u64),
+            Op::read_ok(b + 2, 2u64, [1]),
+            Op::read_ok(b + 3, 0u64, []),
+        ])
+        .unwrap();
+
+        for checker in [SetFullChecker::default(), SetFullChecker::linearizable()] {
+            let result = checker.check(&history);
+            assert_eq!(result.valid, Validity::Valid);
+            assert_eq!(result.stable_count, 1);
+        }
+    }
+
     #[test]
     fn test_observed_failed_add_invalid() {
         let mut history = History::new();
@@ -1819,9 +1842,20 @@ mod tests {
         /// edges close into a cycle, so the cycle proves non-linearizability.
         fn assert_proves_violation(history: &History<i32>, cycle: &PrecedenceCycle<i32>) {
             let ops = history.ops();
+            // Resolves a read event to its result, asserting that the event names a
+            // successful read and its actual invocation.
             let read_state = |event: &Event<i32>| match event {
-                Event::Read { complete_index, .. } => {
-                    let op = ops.iter().find(|op| op.index == *complete_index).unwrap();
+                Event::Read {
+                    invoke_index,
+                    complete_index,
+                } => {
+                    let pos = ops
+                        .iter()
+                        .position(|op| op.index == *complete_index)
+                        .unwrap_or_else(|| panic!("no op {complete_index}"));
+                    let op = &ops[pos];
+                    assert_eq!((op.f, op.op_type), (OpFn::Read, OpType::Ok), "{event:?}");
+                    assert_eq!(history.invocation(pos).unwrap().index, *invoke_index);
                     read_value(op).to_vec()
                 }
                 Event::Add(_) => panic!("expected a read, got {event:?}"),
@@ -1852,6 +1886,11 @@ mod tests {
             assert!(!edges.is_empty());
             for (i, edge) in edges.iter().enumerate() {
                 assert_eq!(edge.after, edges[(i + 1) % edges.len()].before, "{cycle:?}");
+                for event in [&edge.before, &edge.after] {
+                    if let Event::Read { .. } = event {
+                        read_state(event);
+                    }
+                }
                 match edge.reason {
                     Reason::Observed => {
                         let Event::Add(element) = edge.before else {

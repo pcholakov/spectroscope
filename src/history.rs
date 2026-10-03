@@ -580,8 +580,14 @@ mod tests {
         for (name, ops, expected) in cases {
             let (last, prefix) = ops.split_last().unwrap();
             let mut history = History::from_ops(prefix.to_vec()).unwrap();
-            assert_eq!(history.push(last.clone()), Err(expected), "{name}");
-            assert_eq!(history.len(), prefix.len(), "{name}: history changed");
+            let before = format!("{history:?}");
+            // A timestamp exposes a rejected op that still advanced the latest time.
+            let rejected = match last.time {
+                Some(_) => last.clone(),
+                None => last.clone().at_millis(1_000),
+            };
+            assert_eq!(history.push(rejected), Err(expected), "{name}");
+            assert_eq!(format!("{history:?}"), before, "{name}: history changed");
         }
     }
 }
