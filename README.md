@@ -2,7 +2,10 @@
 
 Consistency checkers for distributed systems testing.
 
-Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. It ports [Jepsen](https://github.com/jepsen-io/jepsen)'s set-full workload checker and adds an exact linearizability mode.
+Spectroscope verifies that operation histories from distributed systems conform to expected consistency models. It provides:
+
+- a set checker that ports [Jepsen](https://github.com/jepsen-io/jepsen)'s set-full workload checker and adds an exact linearizability mode;
+- a list-append transaction checker modelled on [Elle](https://github.com/jepsen-io/elle) (Kingsbury and Alvaro, ["Elle: Inferring Isolation Anomalies from Experimental Observations"](https://www.vldb.org/pvldb/vol14/p268-alvaro.pdf), VLDB 2020), working towards strict serializability checking.
 
 ## Installation
 
@@ -88,6 +91,33 @@ Add(1) before Read(2..4)  -- the read observed 1
 Read(2..4) before Add(2)  -- the read missed 2
 Add(2) before Read(3..5)  -- the read observed 2
 Read(3..5) before Add(1)  -- the read missed 1
+```
+
+## List-append transactions
+
+Transactions append unique values to per-key lists and read whole lists, so each read
+reveals the order in which the writes it saw were applied. A system without a native
+append can emulate one with a read and a write of the extended list in one transaction.
+
+`ListAppendChecker` reports the anomalies visible without a dependency graph, using
+Elle's names so results can be compared: `duplicate-appends`, `duplicate-elements`,
+`incompatible-order`, `internal`, `future-read`, `G1a`, `G1b`, `dirty-update` and
+`lost-update`, plus `garbage-read` (a read of a value nothing appended), which Elle does
+not report. Cycle detection for serializability and its real-time variants is not
+implemented yet, so a history without these anomalies is reported as `Unknown`.
+
+```rust
+use spectroscope::{History, ListAppendChecker, MicroOp, Op, Validity};
+
+let history = History::from_ops([
+    Op::txn_invoke(0, 0u64, [MicroOp::append("x", 1)]),
+    Op::txn_ok(1, 0u64, [MicroOp::append("x", 1)]),
+    Op::txn_invoke(2, 1u64, [MicroOp::read("x")]),
+    Op::txn_ok(3, 1u64, [MicroOp::read_result("x", [1, 1])]),
+])?;
+let result = ListAppendChecker.check(&history);
+assert_eq!(result.valid, Validity::Invalid);
+assert_eq!(result.anomalies[0].name(), "duplicate-elements");
 ```
 
 ## License

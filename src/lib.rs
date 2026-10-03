@@ -1,9 +1,10 @@
 //! Consistency checkers for distributed systems testing.
 //!
 //! Spectroscope verifies that operation histories from distributed systems conform to
-//! expected consistency models. Currently implements a set checker derived from
+//! expected consistency models. It implements a set checker derived from
 //! [Jepsen](https://github.com/jepsen-io/jepsen)'s set-full workload, with an exact
-//! linearizability mode.
+//! linearizability mode, and a list-append transaction checker modelled on
+//! [Elle](https://github.com/jepsen-io/elle); see [`list_append`].
 //!
 //! # Quick Start
 //!
@@ -49,7 +50,7 @@ pub mod list_append;
 pub mod set_full;
 
 pub use history::{History, HistoryError, Op, OpType, Operation, Pid, Timestamp};
-pub use list_append::{MicroOp, Txn};
+pub use list_append::{Anomaly, ListAppendChecker, ListAppendResult, MicroOp, Txn, TxnRef};
 pub use set_full::{
     ElementOutcome, Event, Precedence, PrecedenceCycle, Reason, SetFullChecker, SetFullOptions,
     SetFullResult, SetOp, WorstStaleEntry,
