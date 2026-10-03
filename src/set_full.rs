@@ -29,11 +29,83 @@ use std::time::Duration;
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
-use crate::history::{History, Op, OpFn, OpType, OpValue, Timestamp};
+use crate::Validity;
+use crate::history::{History, Op, OpType, Operation, Pid, Timestamp};
 
 mod linearizability;
 
 pub use linearizability::{Event, Precedence, PrecedenceCycle, Reason};
+
+/// An operation on a grow-only set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetOp<T> {
+    /// Add an element. Invocation and completion carry the same element.
+    Add(T),
+    /// Read the whole set. `None` until a successful completion returns the
+    /// elements, in any order; an element listed twice is a duplicate.
+    Read(Option<Vec<T>>),
+}
+
+impl<T: PartialEq> Operation for SetOp<T> {
+    fn is_valid_invocation(&self) -> bool {
+        matches!(self, Self::Add(_) | Self::Read(None))
+    }
+
+    fn is_valid_completion(&self, invocation: &Self, outcome: OpType) -> bool {
+        match (invocation, self) {
+            (Self::Add(requested), Self::Add(completed)) => requested == completed,
+            (Self::Read(None), Self::Read(result)) => result.is_some() == (outcome == OpType::Ok),
+            _ => false,
+        }
+    }
+}
+
+impl<T> Op<SetOp<T>> {
+    /// Create an add invocation.
+    pub fn add_invoke(index: usize, process: impl Into<Pid>, element: T) -> Self {
+        Self::new(index, process, OpType::Invoke, SetOp::Add(element))
+    }
+
+    /// Create a successful add completion.
+    pub fn add_ok(index: usize, process: impl Into<Pid>, element: T) -> Self {
+        Self::new(index, process, OpType::Ok, SetOp::Add(element))
+    }
+
+    /// Create an add that definitely failed.
+    pub fn add_fail(index: usize, process: impl Into<Pid>, element: T) -> Self {
+        Self::new(index, process, OpType::Fail, SetOp::Add(element))
+    }
+
+    /// Create an add with indeterminate outcome (timeout, crash).
+    pub fn add_info(index: usize, process: impl Into<Pid>, element: T) -> Self {
+        Self::new(index, process, OpType::Info, SetOp::Add(element))
+    }
+
+    /// Create a read invocation.
+    pub fn read_invoke(index: usize, process: impl Into<Pid>) -> Self {
+        Self::new(index, process, OpType::Invoke, SetOp::Read(None))
+    }
+
+    /// Create a successful read completion returning `elements`.
+    pub fn read_ok(
+        index: usize,
+        process: impl Into<Pid>,
+        elements: impl IntoIterator<Item = T>,
+    ) -> Self {
+        let elements = elements.into_iter().collect();
+        Self::new(index, process, OpType::Ok, SetOp::Read(Some(elements)))
+    }
+
+    /// Create a read that definitely failed.
+    pub fn read_fail(index: usize, process: impl Into<Pid>) -> Self {
+        Self::new(index, process, OpType::Fail, SetOp::Read(None))
+    }
+
+    /// Create a read with indeterminate outcome.
+    pub fn read_info(index: usize, process: impl Into<Pid>) -> Self {
+        Self::new(index, process, OpType::Info, SetOp::Read(None))
+    }
+}
 
 /// Options for the set-full checker.
 #[derive(Debug, Clone, Default)]
@@ -68,14 +140,6 @@ struct ElementResult<T> {
     /// Index and time of the last read that didn't observe the element.
     last_absent_index: Option<usize>,
     last_absent_time: Option<Duration>,
-}
-
-/// Validity status of the check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Validity {
-    Valid,
-    Invalid,
-    Unknown,
 }
 
 /// Detailed info about a stale element (for worst_stale reporting).
@@ -178,7 +242,7 @@ impl<T: Clone> ElementState<T> {
     }
 
     /// Process an add completion.
-    fn on_add_ok(&mut self, op: &Op<T>) {
+    fn on_add_ok(&mut self, op: &Op<SetOp<T>>) {
         if self.known.is_none() {
             self.known = Some(OpRef {
                 index: op.index,
@@ -188,7 +252,7 @@ impl<T: Clone> ElementState<T> {
     }
 
     /// Process a read that observed this element.
-    fn on_read_present(&mut self, inv: &Op<T>, completion: &Op<T>) {
+    fn on_read_present(&mut self, inv: &Op<SetOp<T>>, completion: &Op<SetOp<T>>) {
         // If we see it in a read before the add completes, we know it exists
         if self.known.is_none() {
             self.known = Some(OpRef {
@@ -211,7 +275,7 @@ impl<T: Clone> ElementState<T> {
     }
 
     /// Process a read that did not observe this element.
-    fn on_read_absent(&mut self, inv: &Op<T>) {
+    fn on_read_absent(&mut self, inv: &Op<SetOp<T>>) {
         if self
             .last_absent
             .as_ref()
@@ -324,7 +388,7 @@ impl SetFullChecker {
 
     /// Check a history for set consistency.
     #[must_use]
-    pub fn check<T>(&self, history: &History<T>) -> SetFullResult<T>
+    pub fn check<T>(&self, history: &History<SetOp<T>>) -> SetFullResult<T>
     where
         T: Clone + Eq + Hash + Ord,
     {
@@ -334,81 +398,65 @@ impl SetFullChecker {
         let mut attempted: HashSet<T> = HashSet::new();
 
         for (pos, op) in history.ops().iter().enumerate() {
-            match op.f {
-                OpFn::Add => {
-                    if let OpValue::Single(ref v) = op.value {
-                        match op.op_type {
-                            OpType::Invoke => {
-                                elements
-                                    .entry(v.clone())
-                                    .or_insert_with(|| ElementState::new(v.clone()));
-                                let outcome = history.completion(pos).map(|c| c.op_type);
-                                if outcome != Some(OpType::Fail) {
-                                    attempted.insert(v.clone());
-                                }
-                            }
-                            OpType::Ok => {
-                                if let Some(state) = elements.get_mut(v) {
-                                    state.on_add_ok(op);
-                                }
-                            }
-                            OpType::Fail | OpType::Info => {}
+            match (&op.value, op.op_type) {
+                (SetOp::Add(element), OpType::Invoke) => {
+                    elements
+                        .entry(element.clone())
+                        .or_insert_with(|| ElementState::new(element.clone()));
+                    let outcome = history.completion(pos).map(|c| c.op_type);
+                    if outcome != Some(OpType::Fail) {
+                        attempted.insert(element.clone());
+                    }
+                }
+                (SetOp::Add(element), OpType::Ok) => {
+                    if let Some(state) = elements.get_mut(element) {
+                        state.on_add_ok(op);
+                    }
+                }
+                (SetOp::Read(Some(returned)), OpType::Ok) => {
+                    let inv = history
+                        .invocation(pos)
+                        .expect("History pairs every completion with its invocation");
+
+                    let mut freqs: HashMap<T, usize> = HashMap::new();
+                    for elem in returned {
+                        *freqs.entry(elem.clone()).or_insert(0) += 1;
+                    }
+                    // Track max multiplicity for elements returned more than once
+                    for (elem, count) in &freqs {
+                        if *count > 1 {
+                            duplicates
+                                .entry(elem.clone())
+                                .and_modify(|c| *c = (*c).max(*count))
+                                .or_insert(*count);
+                        }
+                    }
+                    let read_set: HashSet<T> = freqs.into_keys().collect();
+
+                    // Track elements discovered in reads (not previously added)
+                    for elem in &read_set {
+                        if !elements.contains_key(elem) {
+                            let mut state = ElementState::new(elem.clone());
+                            // Element is known from this read
+                            state.known = Some(OpRef {
+                                index: op.index,
+                                time: op.time,
+                            });
+                            state.on_read_present(inv, op);
+                            elements.insert(elem.clone(), state);
+                        }
+                    }
+
+                    // Update all tracked elements
+                    for (elem, state) in elements.iter_mut() {
+                        if read_set.contains(elem) {
+                            state.on_read_present(inv, op);
+                        } else {
+                            state.on_read_absent(inv);
                         }
                     }
                 }
-                OpFn::Read => {
-                    if op.op_type == OpType::Ok {
-                        let inv = history
-                            .invocation(pos)
-                            .expect("History pairs every completion with its invocation");
-
-                        // Handle both Set and Vec read values
-                        let read_set: HashSet<T> = match &op.value {
-                            OpValue::Set(s) => s.iter().cloned().collect(),
-                            OpValue::Vec(v) => {
-                                // Detect duplicates: count frequencies
-                                let mut freqs: HashMap<T, usize> = HashMap::new();
-                                for elem in v {
-                                    *freqs.entry(elem.clone()).or_insert(0) += 1;
-                                }
-                                // Track max multiplicity for elements with count > 1
-                                for (elem, count) in &freqs {
-                                    if *count > 1 {
-                                        duplicates
-                                            .entry(elem.clone())
-                                            .and_modify(|c| *c = (*c).max(*count))
-                                            .or_insert(*count);
-                                    }
-                                }
-                                freqs.into_keys().collect()
-                            }
-                            _ => unreachable!("History validates read results"),
-                        };
-
-                        // Track elements discovered in reads (not previously added)
-                        for elem in &read_set {
-                            if !elements.contains_key(elem) {
-                                let mut state = ElementState::new(elem.clone());
-                                // Element is known from this read
-                                state.known = Some(OpRef {
-                                    index: op.index,
-                                    time: op.time,
-                                });
-                                state.on_read_present(inv, op);
-                                elements.insert(elem.clone(), state);
-                            }
-                        }
-
-                        // Update all tracked elements
-                        for (elem, state) in elements.iter_mut() {
-                            if read_set.contains(elem) {
-                                state.on_read_present(inv, op);
-                            } else {
-                                state.on_read_absent(inv);
-                            }
-                        }
-                    }
-                }
+                _ => {}
             }
         }
 
@@ -540,7 +588,6 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Pid;
     use std::time::Duration;
 
     /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
@@ -554,30 +601,16 @@ mod tests {
 
     /// Build a history from a sequence of test ops.
     /// Assigns indices sequentially and times of one millisecond per index.
-    fn build_history(ops: Vec<TestOp>) -> History<i32> {
+    fn build_history(ops: Vec<TestOp>) -> History<SetOp<i32>> {
         let mut history = History::new();
         for (idx, test_op) in ops.into_iter().enumerate() {
-            let (op_type, f, value, process) = match test_op {
-                TestOp::AddInvoke(p, v) => (OpType::Invoke, OpFn::Add, OpValue::Single(v), p),
-                TestOp::AddOk(p, v) => (OpType::Ok, OpFn::Add, OpValue::Single(v), p),
-                TestOp::ReadInvoke(p) => (OpType::Invoke, OpFn::Read, OpValue::None, p),
-                TestOp::ReadOk(p, vals) => (
-                    OpType::Ok,
-                    OpFn::Read,
-                    OpValue::Set(HashSet::from_iter(vals)),
-                    p,
-                ),
+            let op = match test_op {
+                TestOp::AddInvoke(p, v) => Op::add_invoke(idx, p, v),
+                TestOp::AddOk(p, v) => Op::add_ok(idx, p, v),
+                TestOp::ReadInvoke(p) => Op::read_invoke(idx, p),
+                TestOp::ReadOk(p, vals) => Op::read_ok(idx, p, vals),
             };
-            history
-                .push(Op {
-                    index: idx,
-                    op_type,
-                    f,
-                    value,
-                    time: Some(Duration::from_millis(idx as u64).into()),
-                    process: Pid::from(process),
-                })
-                .unwrap();
+            history.push(op.at_millis(idx as u64)).unwrap();
         }
         history
     }
@@ -1406,7 +1439,7 @@ mod tests {
 
     // ====== Linearizability ======
 
-    fn check_linearizable(ops: impl IntoIterator<Item = Op<i32>>) -> SetFullResult<i32> {
+    fn check_linearizable(ops: impl IntoIterator<Item = Op<SetOp<i32>>>) -> SetFullResult<i32> {
         SetFullChecker::linearizable().check(&History::from_ops(ops).unwrap())
     }
 
@@ -1586,7 +1619,7 @@ mod tests {
     /// is invalid in both modes, even if every read agrees on it.
     #[test]
     fn test_observed_without_add_invalid() {
-        let cases: [(&str, Vec<Op<i32>>); 3] = [
+        let cases: [(&str, Vec<Op<SetOp<i32>>>); 3] = [
             (
                 "only add failed",
                 vec![Op::add_invoke(0, 0u64, 1), Op::add_fail(1, 0u64, 1)],
@@ -1648,7 +1681,7 @@ mod tests {
         /// Generates a linearizable history by running a sequential set model.
         /// Each op takes effect at a scheduler step strictly between its invocation
         /// and completion; pending ops may or may not have taken effect.
-        fn gen_linearizable(config: &GenConfig, seed: u64) -> Vec<Op<i32>> {
+        fn gen_linearizable(config: &GenConfig, seed: u64) -> Vec<Op<SetOp<i32>>> {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let mut set: BTreeSet<i32> = BTreeSet::new();
             let mut added: Vec<i32> = Vec::new();
@@ -1732,29 +1765,35 @@ mod tests {
                 )
         }
 
-        fn read_value(op: &Op<i32>) -> &[i32] {
-            op.value.as_vec().expect("generated reads return a Vec")
+        fn read_value(op: &Op<SetOp<i32>>) -> &[i32] {
+            match &op.value {
+                SetOp::Read(Some(returned)) => returned,
+                other => panic!("expected a read result, got {other:?}"),
+            }
         }
 
         /// Positions of successful reads and their invocations.
-        fn successful_reads(ops: &[Op<i32>]) -> Vec<(usize, usize)> {
+        fn successful_reads(ops: &[Op<SetOp<i32>>]) -> Vec<(usize, usize)> {
             let history = History::from_ops(ops.to_vec()).unwrap();
             (0..ops.len())
-                .filter(|&pos| ops[pos].f == OpFn::Read && ops[pos].op_type == OpType::Ok)
+                .filter(|&pos| matches!(ops[pos].value, SetOp::Read(Some(_))))
                 .map(|pos| (history.invocation(pos).unwrap().index, pos))
                 .collect()
         }
 
         /// Removes from some read an element whose add completed before the read
         /// was invoked. Returns `None` if no read has such an element.
-        fn inject_stale_read(ops: &mut [Op<i32>], rng: &mut impl Rng) -> Option<()> {
+        fn inject_stale_read(ops: &mut [Op<SetOp<i32>>], rng: &mut impl Rng) -> Option<()> {
             let candidates: Vec<(usize, i32)> = successful_reads(ops)
                 .into_iter()
                 .flat_map(|(invoked, pos)| {
                     ops[..invoked]
                         .iter()
-                        .filter(|op| op.f == OpFn::Add && op.op_type == OpType::Ok)
-                        .map(move |op| (pos, *op.value.as_single().unwrap()))
+                        .filter(|op| op.op_type == OpType::Ok)
+                        .filter_map(move |op| match op.value {
+                            SetOp::Add(element) => Some((pos, element)),
+                            SetOp::Read(_) => None,
+                        })
                 })
                 .collect();
             let &(pos, element) = candidates.choose(rng)?;
@@ -1762,19 +1801,21 @@ mod tests {
                 .iter()
                 .copied()
                 .filter(|&e| e != element);
-            ops[pos].value = OpValue::Vec(state.collect());
+            ops[pos].value = SetOp::Read(Some(state.collect()));
             Some(())
         }
 
         /// Adds to some read an element whose every non-failed add was invoked
         /// after the read completed. Returns `None` if there is no such pair.
-        fn inject_future_read(ops: &mut [Op<i32>], rng: &mut impl Rng) -> Option<()> {
+        fn inject_future_read(ops: &mut [Op<SetOp<i32>>], rng: &mut impl Rng) -> Option<()> {
             let history = History::from_ops(ops.to_vec()).unwrap();
             let mut first_attempt: Vec<(i32, usize)> = Vec::new();
             for (pos, op) in ops.iter().enumerate() {
                 let failed = history.completion(pos).map(|c| c.op_type) == Some(OpType::Fail);
-                if op.f == OpFn::Add && op.op_type == OpType::Invoke && !failed {
-                    let element = *op.value.as_single().unwrap();
+                if let (SetOp::Add(element), OpType::Invoke, false) =
+                    (&op.value, op.op_type, failed)
+                {
+                    let element = *element;
                     if !first_attempt.iter().any(|(e, _)| *e == element) {
                         first_attempt.push((element, op.index));
                     }
@@ -1792,13 +1833,13 @@ mod tests {
             let &(pos, element) = candidates.choose(rng)?;
             let mut state = read_value(&ops[pos]).to_vec();
             state.push(element);
-            ops[pos].value = OpValue::Vec(state);
+            ops[pos].value = SetOp::Read(Some(state));
             Some(())
         }
 
         /// Asserts that every edge of `cycle` is a fact about `history` and the
         /// edges close into a cycle, so the cycle proves non-linearizability.
-        fn assert_proves_violation(history: &History<i32>, cycle: &PrecedenceCycle<i32>) {
+        fn assert_proves_violation(history: &History<SetOp<i32>>, cycle: &PrecedenceCycle<i32>) {
             let ops = history.ops();
             // Resolves a read event to its result, asserting that the event names a
             // successful read and its actual invocation.
@@ -1812,7 +1853,7 @@ mod tests {
                         .position(|op| op.index == *complete_index)
                         .unwrap_or_else(|| panic!("no op {complete_index}"));
                     let op = &ops[pos];
-                    assert_eq!((op.f, op.op_type), (OpFn::Read, OpType::Ok), "{event:?}");
+                    assert!(matches!(op.value, SetOp::Read(Some(_))), "{event:?}");
                     assert_eq!(history.invocation(pos).unwrap().index, *invoke_index);
                     read_value(op).to_vec()
                 }
@@ -1822,10 +1863,7 @@ mod tests {
                 let mut start = None;
                 let mut end = None;
                 for (pos, op) in ops.iter().enumerate() {
-                    if op.f != OpFn::Add
-                        || op.op_type != OpType::Invoke
-                        || op.value.as_single() != Some(&element)
-                    {
+                    if op.op_type != OpType::Invoke || op.value != SetOp::Add(element) {
                         continue;
                     }
                     let completion = history.completion(pos);
@@ -1862,9 +1900,7 @@ mod tests {
                         };
                         assert!(!read_state(&edge.before).contains(&element), "{edge:?}");
                         let observed = ops.iter().any(|op| {
-                            op.f == OpFn::Read
-                                && op.op_type == OpType::Ok
-                                && read_value(op).contains(&element)
+                            matches!(&op.value, SetOp::Read(Some(returned)) if returned.contains(&element))
                         });
                         assert!(observed || add_bounds(element).1.is_some(), "{edge:?}");
                     }
@@ -1941,7 +1977,7 @@ mod tests {
                 fail_ratio: 0.05,
                 crash_ratio: 0.05,
             };
-            let render = |ops: Vec<Op<i32>>| format!("{ops:?}");
+            let render = |ops: Vec<Op<SetOp<i32>>>| format!("{ops:?}");
             assert_eq!(
                 render(gen_linearizable(&config, 7)),
                 render(gen_linearizable(&config, 7))

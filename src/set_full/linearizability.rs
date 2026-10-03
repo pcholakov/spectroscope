@@ -21,7 +21,8 @@ use std::hash::Hash;
 
 use ahash::{HashMap, HashMapExt};
 
-use crate::history::{History, OpFn, OpType, OpValue};
+use super::SetOp;
+use crate::history::{History, OpType};
 
 /// An event in a set history that takes effect at a single point in time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +72,7 @@ pub struct PrecedenceCycle<T> {
 /// Returns a cycle proving `history` is not linearizable, or `None` if no
 /// ordering forbids it. Elements observed without a non-failed add impose no
 /// ordering here; the caller rejects them separately.
-pub(super) fn find_violation<T>(history: &History<T>) -> Option<PrecedenceCycle<T>>
+pub(super) fn find_violation<T>(history: &History<SetOp<T>>) -> Option<PrecedenceCycle<T>>
 where
     T: Clone + Eq + Hash + Ord,
 {
@@ -132,14 +133,14 @@ impl<'a, T> Model<'a, T>
 where
     T: Clone + Eq + Hash + Ord,
 {
-    fn new(history: &'a History<T>) -> Self {
+    fn new(history: &'a History<SetOp<T>>) -> Self {
         let mut windows: HashMap<&T, AddWindow> = HashMap::new();
         let mut reads = Vec::new();
         let mut states: HashMap<Vec<&T>, Vec<usize>> = HashMap::new();
 
         for (pos, op) in history.ops().iter().enumerate() {
-            match (op.f, op.op_type, &op.value) {
-                (OpFn::Add, OpType::Invoke, OpValue::Single(element)) => {
+            match (&op.value, op.op_type) {
+                (SetOp::Add(element), OpType::Invoke) => {
                     let window = windows.entry(element).or_default();
                     match history.completion(pos).map(|c| (c.op_type, c.index)) {
                         Some((OpType::Fail, _)) => {}
@@ -152,12 +153,8 @@ where
                         }
                     }
                 }
-                (OpFn::Read, OpType::Ok, value) => {
-                    let mut state: Vec<&T> = match value {
-                        OpValue::Set(s) => s.iter().collect(),
-                        OpValue::Vec(v) => v.iter().collect(),
-                        _ => unreachable!("History validates read results"),
-                    };
+                (SetOp::Read(Some(returned)), OpType::Ok) => {
+                    let mut state: Vec<&T> = returned.iter().collect();
                     state.sort_unstable();
                     state.dedup();
                     let invocation = history

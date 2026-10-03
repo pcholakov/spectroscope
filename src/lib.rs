@@ -47,8 +47,20 @@
 pub mod history;
 pub mod set_full;
 
-pub use history::{History, HistoryError, Op, OpFn, OpType, OpValue, Pid, Timestamp};
+pub use history::{History, HistoryError, Op, OpType, Operation, Pid, Timestamp};
 pub use set_full::{
     ElementOutcome, Event, Precedence, PrecedenceCycle, Reason, SetFullChecker, SetFullOptions,
-    SetFullResult, Validity, WorstStaleEntry,
+    SetFullResult, SetOp, WorstStaleEntry,
 };
+
+/// The verdict of a consistency check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validity {
+    /// The history satisfies the consistency model.
+    Valid,
+    /// The history violates the consistency model.
+    Invalid,
+    /// The history contains too little information to decide, such as no
+    /// successful reads.
+    Unknown,
+}

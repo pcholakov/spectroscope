@@ -15,7 +15,8 @@ spectroscope = "0.1"
 
 ```rust
 use spectroscope::history::{History, Op, Pid};
-use spectroscope::set_full::{SetFullChecker, Validity};
+use spectroscope::Validity;
+use spectroscope::set_full::SetFullChecker;
 
 // Workload set value type
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

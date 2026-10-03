@@ -2,8 +2,9 @@
 //!
 //! Run with: cargo run --example basic
 
+use spectroscope::Validity;
 use spectroscope::history::{History, HistoryError, Op, Pid};
-use spectroscope::set_full::{SetFullChecker, Validity};
+use spectroscope::set_full::SetFullChecker;
 
 /// A value being added to or read from the set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
