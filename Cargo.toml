@@ -2,7 +2,7 @@
 name = "spectroscope"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "EPL-1.0"
 description = "Consistency and isolation level checkers for distributed systems testing"
 repository = "https://github.com/pcholakov/spectroscope"

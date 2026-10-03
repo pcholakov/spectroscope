@@ -1,32 +1,29 @@
-//! Basic usage of the set-full linearizability checker.
+//! Basic usage of the set-full checker.
 //!
 //! Run with: cargo run --example basic
 
-use spectroscope::history::{History, Op, Pid};
+use spectroscope::history::{History, HistoryError, Op, Pid};
 use spectroscope::set_full::{SetFullChecker, Validity};
 
 /// A value being added to or read from the set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Val(u32);
 
-fn main() {
-    // A history records operations from concurrent processes.
-    // Each operation has an invocation (start) and completion (ok/fail).
+fn main() -> Result<(), HistoryError> {
+    // A history records operations from concurrent processes, in real-time order.
+    // Each operation has an invocation (start) and completion (ok/fail/info).
     let mut history = History::new();
 
-    // Process 0 adds element 1
-    history.push(Op::add_invoke(0, Pid(0), Val(1)).at_millis(0));
-    history.push(Op::add_ok(1, Pid(0), Val(1)).at_millis(5));
-
-    // Process 1 adds element 2
-    history.push(Op::add_invoke(2, Pid(1), Val(2)).at_millis(2));
-    history.push(Op::add_ok(3, Pid(1), Val(2)).at_millis(7));
+    // Processes 0 and 1 add elements 1 and 2 concurrently
+    history.push(Op::add_invoke(0, Pid(0), Val(1)).at_millis(0))?;
+    history.push(Op::add_invoke(1, Pid(1), Val(2)).at_millis(2))?;
+    history.push(Op::add_ok(2, Pid(0), Val(1)).at_millis(5))?;
+    history.push(Op::add_ok(3, Pid(1), Val(2)).at_millis(7))?;
 
     // Process 2 reads and sees both elements
-    history.push(Op::read_invoke(4, Pid(2)).at_millis(10));
-    history.push(Op::read_ok(5, Pid(2), [Val(1), Val(2)]).at_millis(12));
+    history.push(Op::read_invoke(4, Pid(2)).at_millis(10))?;
+    history.push(Op::read_ok(5, Pid(2), [Val(1), Val(2)]).at_millis(12))?;
 
-    // Check the history
     let result = SetFullChecker::default().check(&history);
 
     println!("Validity: {:?}", result.valid);
@@ -36,30 +33,61 @@ fn main() {
 
     assert_eq!(result.valid, Validity::Valid);
 
-    // Now let's create an invalid history where an element disappears
     println!("\n--- Invalid history (element lost) ---\n");
 
-    let mut bad_history = History::new();
+    let mut lost_history = History::new();
 
     // Add element 1
-    bad_history.push(Op::add_invoke(0, Pid(0), Val(1)).at_millis(0));
-    bad_history.push(Op::add_ok(1, Pid(0), Val(1)).at_millis(5));
+    lost_history.push(Op::add_invoke(0, Pid(0), Val(1)).at_millis(0))?;
+    lost_history.push(Op::add_ok(1, Pid(0), Val(1)).at_millis(5))?;
 
     // First read sees it
-    bad_history.push(Op::read_invoke(2, Pid(1)).at_millis(10));
-    bad_history.push(Op::read_ok(3, Pid(1), [Val(1)]).at_millis(12));
+    lost_history.push(Op::read_invoke(2, Pid(1)).at_millis(10))?;
+    lost_history.push(Op::read_ok(3, Pid(1), [Val(1)]).at_millis(12))?;
 
     // Second read doesn't see it - element was lost!
-    bad_history.push(Op::read_invoke(4, Pid(1)).at_millis(20));
-    bad_history.push(Op::read_ok(5, Pid(1), []).at_millis(22));
+    lost_history.push(Op::read_invoke(4, Pid(1)).at_millis(20))?;
+    lost_history.push(Op::read_ok(5, Pid(1), []).at_millis(22))?;
 
-    let bad_result = SetFullChecker::default().check(&bad_history);
+    let lost_result = SetFullChecker::default().check(&lost_history);
 
-    println!("Validity: {:?}", bad_result.valid);
-    println!("Lost elements: {:?}", bad_result.lost);
+    println!("Validity: {:?}", lost_result.valid);
+    println!("Lost elements: {:?}", lost_result.lost);
 
-    assert_eq!(bad_result.valid, Validity::Invalid);
-    assert_eq!(bad_result.lost, vec![Val(1)]);
+    assert_eq!(lost_result.valid, Validity::Invalid);
+    assert_eq!(lost_result.lost, vec![Val(1)]);
+
+    println!("\n--- Non-linearizable history (readers disagree on order) ---\n");
+
+    // Two concurrent reads, each concurrent with both adds, see different elements.
+    // Every element is visible without staleness, so only linearizable mode rejects it.
+    let divergent = History::from_ops([
+        Op::add_invoke(0, Pid(0), Val(1)),
+        Op::add_invoke(1, Pid(1), Val(2)),
+        Op::read_invoke(2, Pid(2)),
+        Op::read_invoke(3, Pid(3)),
+        Op::read_ok(4, Pid(2), [Val(1)]),
+        Op::read_ok(5, Pid(3), [Val(2)]),
+        Op::add_ok(6, Pid(0), Val(1)),
+        Op::add_ok(7, Pid(1), Val(2)),
+    ])?;
+
+    assert_eq!(
+        SetFullChecker::default().check(&divergent).valid,
+        Validity::Valid
+    );
+    let divergent_result = SetFullChecker::linearizable().check(&divergent);
+
+    println!("Validity: {:?}", divergent_result.valid);
+    for edge in &divergent_result.linearizability_violation.unwrap().edges {
+        println!(
+            "{:?} before {:?} ({:?})",
+            edge.before, edge.after, edge.reason
+        );
+    }
+
+    assert_eq!(divergent_result.valid, Validity::Invalid);
 
     println!("\nDone!");
+    Ok(())
 }

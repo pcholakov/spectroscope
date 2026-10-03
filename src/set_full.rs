@@ -1,4 +1,4 @@
-//! Set-full linearizability checker.
+//! Set-full checker.
 //!
 //! Analyzes histories with `Add` and `Read` operations to detect consistency violations.
 //! For each element added to the set, we track:
@@ -12,9 +12,14 @@
 //! - **lost**: was known but then disappeared
 //! - **never-read**: no read began after the element was known
 //!
-//! When `linearizable` is enabled, an element must appear immediately in the next read
-//! after being added (zero stable latency), otherwise it's considered "stale" and the
-//! check fails.
+//! These per-element outcomes measure eventual consistency. An element is **stale**
+//! when some read invoked after it was known still missed it.
+//!
+//! When `linearizable` is enabled, the checker additionally decides whether the whole
+//! history is linearizable. That is stronger than requiring every element to be
+//! visible without staleness: a read returns the entire set at once, so every reader
+//! must also agree on a single order in which elements appeared. A violation is
+//! reported as a [`PrecedenceCycle`] of orderings that cannot all hold.
 //!
 //! Derived from [Jepsen's set-full
 //! checker](https://jepsen-io.github.io/jepsen/jepsen.checker.html#var-set-full).
@@ -22,14 +27,18 @@
 use std::hash::Hash;
 use std::time::Duration;
 
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use crate::history::{History, Op, OpFn, OpType, OpValue, Timestamp};
+
+mod linearizability;
+
+pub use linearizability::{Event, Precedence, PrecedenceCycle, Reason};
 
 /// Options for the set-full checker.
 #[derive(Debug, Clone, Default)]
 pub struct SetFullOptions {
-    /// If true, require zero stable latency (immediate visibility after add).
+    /// If true, the history must be linearizable.
     pub linearizable: bool,
 }
 
@@ -46,19 +55,19 @@ pub enum ElementOutcome {
 
 /// Detailed result for a single element.
 #[derive(Debug, Clone)]
-pub struct ElementResult<T> {
-    pub element: T,
-    pub outcome: ElementOutcome,
+struct ElementResult<T> {
+    element: T,
+    outcome: ElementOutcome,
     /// Latency in milliseconds until the element became stable (if stable).
-    pub stable_latency_ms: Option<u64>,
+    stable_latency_ms: Option<u64>,
     /// Latency in milliseconds until the element was lost (if lost).
-    pub lost_latency_ms: Option<u64>,
+    lost_latency_ms: Option<u64>,
     /// Index and time when the element was first known to exist.
-    pub known_index: Option<usize>,
-    pub known_time: Option<Duration>,
+    known_index: Option<usize>,
+    known_time: Option<Duration>,
     /// Index and time of the last read that didn't observe the element.
-    pub last_absent_index: Option<usize>,
-    pub last_absent_time: Option<Duration>,
+    last_absent_index: Option<usize>,
+    last_absent_time: Option<Duration>,
 }
 
 /// Validity status of the check.
@@ -98,12 +107,17 @@ pub struct SetFullResult<T> {
     pub lost: Vec<T>,
     /// Elements that were never read.
     pub never_read: Vec<T>,
-    /// Elements that were stale (non-zero stable latency).
+    /// Stable elements that some read missed after they were known.
     pub stale: Vec<T>,
     /// Top 8 stale elements with highest latency, with detailed info.
     pub worst_stale: Vec<WorstStaleEntry<T>>,
     /// Elements with duplicates and their max multiplicity.
     pub duplicated: HashMap<T, usize>,
+    /// Elements returned by a read although every add of them failed.
+    pub observed_failed: Vec<T>,
+    /// In linearizable mode, proof that the history is not linearizable.
+    /// Always `None` otherwise.
+    pub linearizability_violation: Option<PrecedenceCycle<T>>,
     /// Raw stable latencies in milliseconds (unsorted).
     stable_latencies: Vec<u64>,
     /// Raw lost latencies in milliseconds (unsorted).
@@ -310,10 +324,11 @@ impl SetFullChecker {
     where
         T: Clone + Eq + Hash + Ord,
     {
-        use std::collections::HashSet;
-
         let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
         let mut duplicates: HashMap<T, usize> = HashMap::new();
+        // Elements with an add that did not fail, and elements with a failed add.
+        let mut attempted: HashSet<T> = HashSet::new();
+        let mut failed: HashSet<T> = HashSet::new();
 
         for (pos, op) in history.ops().iter().enumerate() {
             match op.f {
@@ -321,29 +336,31 @@ impl SetFullChecker {
                     if let OpValue::Single(ref v) = op.value {
                         match op.op_type {
                             OpType::Invoke => {
-                                // Start tracking this element
                                 elements
                                     .entry(v.clone())
                                     .or_insert_with(|| ElementState::new(v.clone()));
+                                let outcome = history.completion(pos).map(|c| c.op_type);
+                                if outcome != Some(OpType::Fail) {
+                                    attempted.insert(v.clone());
+                                }
                             }
                             OpType::Ok => {
-                                // Mark as known (create if missing - handles add_ok without invoke)
-                                elements
-                                    .entry(v.clone())
-                                    .or_insert_with(|| ElementState::new(v.clone()))
-                                    .on_add_ok(op);
+                                if let Some(state) = elements.get_mut(v) {
+                                    state.on_add_ok(op);
+                                }
                             }
-                            _ => {}
+                            OpType::Fail => {
+                                failed.insert(v.clone());
+                            }
+                            OpType::Info => {}
                         }
                     }
                 }
                 OpFn::Read => {
                     if op.op_type == OpType::Ok {
-                        // Find the invocation for this read using position in history
-                        let inv = match history.invocation(pos) {
-                            Some(i) => i,
-                            None => continue,
-                        };
+                        let inv = history
+                            .invocation(pos)
+                            .expect("History pairs every completion with its invocation");
 
                         // Handle both Set and Vec read values
                         let read_set: HashSet<T> = match &op.value {
@@ -365,7 +382,7 @@ impl SetFullChecker {
                                 }
                                 freqs.into_keys().collect()
                             }
-                            _ => continue,
+                            _ => unreachable!("History validates read results"),
                         };
 
                         // Track elements discovered in reads (not previously added)
@@ -395,7 +412,14 @@ impl SetFullChecker {
             }
         }
 
-        // Compute results
+        let mut observed_failed: Vec<T> = failed
+            .into_iter()
+            .filter(|e| {
+                !attempted.contains(e) && elements.get(e).is_some_and(|s| s.last_present.is_some())
+            })
+            .collect();
+        observed_failed.sort();
+
         let mut results: Vec<ElementResult<T>> = elements
             .into_values()
             .map(|state| state.into_result())
@@ -428,15 +452,14 @@ impl SetFullChecker {
             }
         }
 
-        // Stale elements: stable but with non-zero latency, or with index-based staleness
-        // when timestamps are missing
+        // A stale element was missed by a read invoked after it was known. History
+        // timestamps never decrease, so this covers every non-zero stable latency.
         let mut stale_results: Vec<&ElementResult<T>> = results
             .iter()
             .filter(|r| {
                 r.outcome == ElementOutcome::Stable
-                    && (r.stable_latency_ms.unwrap_or(0) > 0
-                        || r.last_absent_index
-                            .is_some_and(|la| r.known_index.is_some_and(|k| la > k)))
+                    && r.last_absent_index
+                        .is_some_and(|la| r.known_index.is_some_and(|k| la > k))
             })
             .collect();
 
@@ -464,10 +487,17 @@ impl SetFullChecker {
 
         let stale: Vec<T> = stale_results.iter().map(|r| r.element.clone()).collect();
 
-        // Determine validity
+        // Every stale or lost element also yields a linearizability violation.
+        let linearizability_violation = if self.options.linearizable {
+            linearizability::find_violation(history)
+        } else {
+            None
+        };
+
         let valid = if !lost.is_empty()
-            || (self.options.linearizable && !stale.is_empty())
             || !duplicates.is_empty()
+            || !observed_failed.is_empty()
+            || linearizability_violation.is_some()
         {
             Validity::Invalid
         } else if stable.is_empty() {
@@ -489,6 +519,8 @@ impl SetFullChecker {
             stale,
             worst_stale,
             duplicated: duplicates,
+            observed_failed,
+            linearizability_violation,
             stable_latencies,
             lost_latencies,
         }
@@ -510,7 +542,6 @@ fn percentile(values: &[u64], p: f64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::history::Pid;
-    use std::collections::HashSet;
     use std::time::Duration;
 
     /// Operation builder for tests. Mimics Jepsen's invoke-op/ok-op pattern.
@@ -523,7 +554,7 @@ mod tests {
     }
 
     /// Build a history from a sequence of test ops.
-    /// Assigns indices sequentially and times as index * 1_000_000 (microseconds).
+    /// Assigns indices sequentially and times of one millisecond per index.
     fn build_history(ops: Vec<TestOp>) -> History<i32> {
         let mut history = History::new();
         for (idx, test_op) in ops.into_iter().enumerate() {
@@ -538,14 +569,16 @@ mod tests {
                     p,
                 ),
             };
-            history.push(Op {
-                index: idx,
-                op_type,
-                f,
-                value,
-                time: Some(Duration::from_nanos(idx as u64 * 1_000_000).into()), // microseconds, like Jepsen
-                process: Pid::from(process),
-            });
+            history
+                .push(Op {
+                    index: idx,
+                    op_type,
+                    f,
+                    value,
+                    time: Some(Duration::from_millis(idx as u64).into()),
+                    process: Pid::from(process),
+                })
+                .unwrap();
         }
         history
     }
@@ -611,10 +644,12 @@ mod tests {
     fn test_failed_add_ignored() {
         // Failed adds should not affect element tracking
         let mut history = History::new();
-        history.push(Op::add_invoke(0, 0u64, 1));
-        history.push(Op::add_fail(1, 0u64, 1));
-        history.push(Op::read_invoke(2, 0u64));
-        history.push(Op::read_ok(3, 0u64, Vec::<i32>::new()));
+        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
+        history.push(Op::add_fail(1, 0u64, 1)).unwrap();
+        history.push(Op::read_invoke(2, 0u64)).unwrap();
+        history
+            .push(Op::read_ok(3, 0u64, Vec::<i32>::new()))
+            .unwrap();
 
         let result = SetFullChecker::default().check(&history);
         // Element was invoked but failed, so it's tracked but unknown outcome
@@ -626,10 +661,10 @@ mod tests {
     fn test_info_operations_ignored() {
         // Info (indeterminate) operations should be handled gracefully
         let mut history = History::new();
-        history.push(Op::add_invoke(0, 0u64, 1));
-        history.push(Op::add_info(1, 0u64, 1));
-        history.push(Op::read_invoke(2, 1u64));
-        history.push(Op::read_ok(3, 1u64, vec![1]));
+        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
+        history.push(Op::add_info(1, 0u64, 1)).unwrap();
+        history.push(Op::read_invoke(2, 1u64)).unwrap();
+        history.push(Op::read_ok(3, 1u64, vec![1])).unwrap();
 
         let result = SetFullChecker::default().check(&history);
         // Element seen in read, so it's known and stable
@@ -812,8 +847,6 @@ mod tests {
         assert_eq!(result.valid, Validity::Invalid);
         assert_eq!(result.attempt_count, 2);
 
-        // Element 0 is lost: known at 1, last present at 9 (invoke 6), but last absent at 7
-        // Wait, let me trace this:
         // Element 0: known at index 1 (a0_ok)
         //   r2 at index 3 -> r2_1 at 4 (doesn't contain 0) -> last_absent = 3
         //   r2 at index 6 -> r2_0 at 9 (contains 0) -> last_present = 6
@@ -857,11 +890,19 @@ mod tests {
     fn test_duplicates_in_read() {
         // Read returns an element multiple times (duplicate)
         let mut history = History::new();
-        history.push(Op::add_invoke(0, 0u64, 0).at(Timestamp::from_millis(0)));
-        history.push(Op::add_ok(1, 0u64, 0).at(Timestamp::from_millis(1)));
-        history.push(Op::read_invoke(2, 1u64).at(Timestamp::from_millis(2)));
+        history
+            .push(Op::add_invoke(0, 0u64, 0).at(Timestamp::from_millis(0)))
+            .unwrap();
+        history
+            .push(Op::add_ok(1, 0u64, 0).at(Timestamp::from_millis(1)))
+            .unwrap();
+        history
+            .push(Op::read_invoke(2, 1u64).at(Timestamp::from_millis(2)))
+            .unwrap();
         // Read returns element 0 three times (duplicate!)
-        history.push(Op::read_ok(3, 1u64, [0, 0, 0]).at(Timestamp::from_millis(3)));
+        history
+            .push(Op::read_ok(3, 1u64, [0, 0, 0]).at(Timestamp::from_millis(3)))
+            .unwrap();
 
         let result = SetFullChecker::default().check(&history);
 
@@ -913,19 +954,30 @@ mod tests {
         // Add elements 0, 1, 2 at staggered times
         for elem in 0..3 {
             let ms = |n: usize| Timestamp::from_millis(n as u64);
-            history.push(Op::add_invoke(elem * 2, elem as u64, elem as i32).at(ms(elem * 2)));
-            history.push(Op::add_ok(elem * 2 + 1, elem as u64, elem as i32).at(ms(elem * 2 + 1)));
+            history
+                .push(Op::add_invoke(elem * 2, elem as u64, elem as i32).at(ms(elem * 2)))
+                .unwrap();
+            history
+                .push(Op::add_ok(elem * 2 + 1, elem as u64, elem as i32).at(ms(elem * 2 + 1)))
+                .unwrap();
         }
         // Element 0 known at index 1 (1ms), Element 1 at index 3 (3ms), Element 2 at index 5 (5ms)
 
         // Read that misses all (creating absent records)
-        history.push(Op::read_invoke(6, 10u64).at(Timestamp::from_millis(6)));
         history
-            .push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Timestamp::from_millis(7)));
+            .push(Op::read_invoke(6, 10u64).at(Timestamp::from_millis(6)))
+            .unwrap();
+        history
+            .push(Op::read_ok(7, 10u64, std::iter::empty::<i32>()).at(Timestamp::from_millis(7)))
+            .unwrap();
 
         // Read that sees all (making them stable)
-        history.push(Op::read_invoke(8, 10u64).at(Timestamp::from_millis(8)));
-        history.push(Op::read_ok(9, 10u64, [0, 1, 2]).at(Timestamp::from_millis(9)));
+        history
+            .push(Op::read_invoke(8, 10u64).at(Timestamp::from_millis(8)))
+            .unwrap();
+        history
+            .push(Op::read_ok(9, 10u64, [0, 1, 2]).at(Timestamp::from_millis(9)))
+            .unwrap();
 
         let result = SetFullChecker::default().check(&history);
 
@@ -955,12 +1007,20 @@ mod tests {
         let mut history = History::new();
 
         // Read sees element 42, but there's no add for it
-        history.push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)));
-        history.push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)));
+        history
+            .push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)))
+            .unwrap();
+        history
+            .push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)))
+            .unwrap();
 
         // Second read also sees it
-        history.push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)));
-        history.push(Op::read_ok(3, 0u64, [42]).at(Timestamp::from_millis(3)));
+        history
+            .push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)))
+            .unwrap();
+        history
+            .push(Op::read_ok(3, 0u64, [42]).at(Timestamp::from_millis(3)))
+            .unwrap();
 
         let result = SetFullChecker::default().check(&history);
 
@@ -975,11 +1035,19 @@ mod tests {
         // Element appears in read, then disappears - should be lost
         let mut history = History::new();
 
-        history.push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)));
-        history.push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)));
+        history
+            .push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)))
+            .unwrap();
+        history
+            .push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)))
+            .unwrap();
 
-        history.push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)));
-        history.push(Op::read_ok(3, 0u64, []).at(Timestamp::from_millis(3)));
+        history
+            .push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)))
+            .unwrap();
+        history
+            .push(Op::read_ok(3, 0u64, []).at(Timestamp::from_millis(3)))
+            .unwrap();
 
         let result = SetFullChecker::default().check(&history);
 
@@ -987,44 +1055,6 @@ mod tests {
         assert_eq!(result.lost_count, 1);
         assert!(result.lost.contains(&42));
         assert_eq!(result.valid, Validity::Invalid);
-    }
-
-    #[test]
-    fn test_add_ok_without_invoke() {
-        // add_ok appears without a prior add_invoke - should still track element
-        let mut history = History::new();
-
-        // Only the completion, no invoke
-        history.push(Op::add_ok(0, 0u64, 99).at(Timestamp::from_millis(0)));
-
-        // Read sees the element
-        history.push(Op::read_invoke(1, 1u64).at(Timestamp::from_millis(1)));
-        history.push(Op::read_ok(2, 1u64, [99]).at(Timestamp::from_millis(2)));
-
-        let result = SetFullChecker::default().check(&history);
-
-        assert_eq!(result.attempt_count, 1);
-        assert_eq!(result.stable_count, 1);
-        assert_eq!(result.valid, Validity::Valid);
-    }
-
-    #[test]
-    fn test_invocation_matches_correct_op_fn() {
-        // Verify that read_ok matches read_invoke, not add_invoke from same process
-        let mut history = History::new();
-
-        // Process 0: add invoke, then read invoke, then read ok
-        // The read_ok should match the read_invoke, not the add_invoke
-        history.push(Op::add_invoke(0, 0u64, 1).at(Timestamp::from_millis(0)));
-        history.push(Op::read_invoke(1, 0u64).at(Timestamp::from_millis(1)));
-        history.push(Op::read_ok(2, 0u64, [1]).at(Timestamp::from_millis(2)));
-        history.push(Op::add_ok(3, 0u64, 1).at(Timestamp::from_millis(3)));
-
-        let result = SetFullChecker::default().check(&history);
-
-        // Should work correctly - element is stable
-        assert_eq!(result.stable_count, 1);
-        assert_eq!(result.valid, Validity::Valid);
     }
 
     // ====== Bug fix regression tests ======
@@ -1057,16 +1087,18 @@ mod tests {
         let mut history = History::new();
 
         // Add element without timestamps
-        history.push(Op::add_invoke(0, 0u64, 1));
-        history.push(Op::add_ok(1, 0u64, 1));
+        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
+        history.push(Op::add_ok(1, 0u64, 1)).unwrap();
 
         // Read after add completes that misses the element (no timestamps)
-        history.push(Op::read_invoke(2, 1u64));
-        history.push(Op::read_ok(3, 1u64, std::iter::empty::<i32>()));
+        history.push(Op::read_invoke(2, 1u64)).unwrap();
+        history
+            .push(Op::read_ok(3, 1u64, std::iter::empty::<i32>()))
+            .unwrap();
 
         // Later read that sees the element
-        history.push(Op::read_invoke(4, 1u64));
-        history.push(Op::read_ok(5, 1u64, [1]));
+        history.push(Op::read_invoke(4, 1u64)).unwrap();
+        history.push(Op::read_ok(5, 1u64, [1])).unwrap();
 
         // In eventual consistency mode, this is valid (stale but not a violation)
         let eventual_result = SetFullChecker::default().check(&history);
@@ -1089,12 +1121,12 @@ mod tests {
         let mut history = History::new();
 
         // Add element without timestamps
-        history.push(Op::add_invoke(0, 0u64, 1));
-        history.push(Op::add_ok(1, 0u64, 1));
+        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
+        history.push(Op::add_ok(1, 0u64, 1)).unwrap();
 
         // First read after add sees the element (no staleness)
-        history.push(Op::read_invoke(2, 1u64));
-        history.push(Op::read_ok(3, 1u64, [1]));
+        history.push(Op::read_invoke(2, 1u64)).unwrap();
+        history.push(Op::read_ok(3, 1u64, [1])).unwrap();
 
         let linearizable_result = SetFullChecker::linearizable().check(&history);
         assert_eq!(linearizable_result.valid, Validity::Valid);
@@ -1431,582 +1463,492 @@ mod tests {
         assert_eq!(result.never_read_count, num_elements as usize);
     }
 
-    #[cfg(test)]
+    // ====== Linearizability ======
+
+    fn check_linearizable(ops: impl IntoIterator<Item = Op<i32>>) -> SetFullResult<i32> {
+        SetFullChecker::linearizable().check(&History::from_ops(ops).unwrap())
+    }
+
+    fn read(invoke_index: usize, complete_index: usize) -> Event<i32> {
+        Event::Read {
+            invoke_index,
+            complete_index,
+        }
+    }
+
+    fn precedes(before: Event<i32>, after: Event<i32>, reason: Reason) -> Precedence<i32> {
+        Precedence {
+            before,
+            after,
+            reason,
+        }
+    }
+
+    fn real_time(completed_index: usize, invoked_index: usize) -> Reason {
+        Reason::RealTime {
+            completed_index,
+            invoked_index,
+        }
+    }
+
+    /// Concurrent reads disagree on the order in which concurrent adds took effect.
+    /// Each element is visible without staleness, so only a whole-history check sees it.
+    #[test]
+    fn test_divergent_reads_not_linearizable() {
+        let ops = [
+            Op::add_invoke(0, 0u64, 1),
+            Op::add_invoke(1, 1u64, 2),
+            Op::read_invoke(2, 2u64),
+            Op::read_invoke(3, 3u64),
+            Op::read_ok(4, 2u64, [1]),
+            Op::read_ok(5, 3u64, [2]),
+            Op::add_ok(6, 0u64, 1),
+            Op::add_ok(7, 1u64, 2),
+        ];
+        let history = History::from_ops(ops.clone()).unwrap();
+        assert_eq!(
+            SetFullChecker::default().check(&history).valid,
+            Validity::Valid
+        );
+
+        let result = check_linearizable(ops);
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(result.stale_count, 0);
+        assert_eq!(
+            result.linearizability_violation.unwrap().edges,
+            vec![
+                precedes(Event::Add(1), read(2, 4), Reason::Observed),
+                precedes(read(2, 4), Event::Add(2), Reason::Missed),
+                precedes(Event::Add(2), read(3, 5), Reason::Observed),
+                precedes(read(3, 5), Event::Add(1), Reason::Missed),
+            ]
+        );
+    }
+
+    /// A read returns an element whose add had not been invoked yet.
+    #[test]
+    fn test_read_from_future_not_linearizable() {
+        let result = check_linearizable([
+            Op::read_invoke(0, 0u64),
+            Op::read_ok(1, 0u64, [1]),
+            Op::add_invoke(2, 1u64, 1),
+            Op::add_ok(3, 1u64, 1),
+        ]);
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(
+            result.linearizability_violation.unwrap().edges,
+            vec![
+                precedes(Event::Add(1), read(0, 1), Reason::Observed),
+                precedes(read(0, 1), Event::Add(1), real_time(1, 2)),
+            ]
+        );
+    }
+
+    /// A read invoked after another completed returns an older state of the set.
+    #[test]
+    fn test_reads_going_backwards_not_linearizable() {
+        let result = check_linearizable([
+            Op::add_invoke(0, 0u64, 1),
+            Op::add_ok(1, 0u64, 1),
+            Op::add_invoke(2, 1u64, 2),
+            Op::read_invoke(3, 2u64),
+            Op::read_ok(4, 2u64, [1, 2]),
+            Op::read_invoke(5, 3u64),
+            Op::read_ok(6, 3u64, [1]),
+        ]);
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(
+            result.linearizability_violation.unwrap().edges,
+            vec![
+                precedes(read(5, 6), Event::Add(2), Reason::Missed),
+                precedes(Event::Add(2), read(3, 4), Reason::Observed),
+                precedes(read(3, 4), read(5, 6), real_time(4, 5)),
+            ]
+        );
+    }
+
+    /// Add 2 completes before add 1 is invoked, yet a read sees 1 without 2.
+    /// The read was invoked before add 2 completed, so neither element is stale.
+    #[test]
+    fn test_adds_out_of_order_not_linearizable() {
+        let ops = [
+            Op::read_invoke(0, 0u64),
+            Op::add_invoke(1, 1u64, 2),
+            Op::add_ok(2, 1u64, 2),
+            Op::add_invoke(3, 2u64, 1),
+            Op::read_ok(4, 0u64, [1]),
+            Op::add_ok(5, 2u64, 1),
+            Op::read_invoke(6, 3u64),
+            Op::read_ok(7, 3u64, [1, 2]),
+        ];
+        let history = History::from_ops(ops.clone()).unwrap();
+        assert_eq!(
+            SetFullChecker::default().check(&history).valid,
+            Validity::Valid
+        );
+
+        let result = check_linearizable(ops);
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(
+            result.linearizability_violation.unwrap().edges,
+            vec![
+                precedes(Event::Add(1), read(0, 4), Reason::Observed),
+                precedes(read(0, 4), Event::Add(2), Reason::Missed),
+                precedes(Event::Add(2), Event::Add(1), real_time(2, 3)),
+            ]
+        );
+    }
+
+    /// A stale read is the simplest violation: one missed element, one real-time edge.
+    #[test]
+    fn test_stale_read_witness() {
+        let result = SetFullChecker::linearizable().check(&build_history(vec![
+            TestOp::AddInvoke(0, 1),
+            TestOp::AddOk(0, 1),
+            TestOp::ReadInvoke(1),
+            TestOp::ReadOk(1, vec![]),
+            TestOp::ReadInvoke(2),
+            TestOp::ReadOk(2, vec![1]),
+        ]));
+        assert_eq!(
+            result.linearizability_violation.unwrap().edges,
+            vec![
+                precedes(read(2, 3), Event::Add(1), Reason::Missed),
+                precedes(Event::Add(1), read(2, 3), real_time(1, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_observed_failed_add_invalid() {
+        let mut history = History::new();
+        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
+        history.push(Op::add_fail(1, 0u64, 1)).unwrap();
+        history.push(Op::read_invoke(2, 1u64)).unwrap();
+        history.push(Op::read_ok(3, 1u64, [1])).unwrap();
+
+        let result = SetFullChecker::default().check(&history);
+        assert_eq!(result.valid, Validity::Invalid);
+        assert_eq!(result.observed_failed, vec![1]);
+    }
+
     mod property_tests {
         use super::*;
         use proptest::prelude::*;
-        use rand::seq::{IndexedRandom, IteratorRandom};
+        use rand::seq::IndexedRandom;
         use rand::{Rng, SeedableRng};
-        use std::collections::{HashMap, HashSet};
+        use std::collections::BTreeSet;
 
-        /// Controls whether to generate valid or invalid histories
-        #[derive(Debug, Clone, Copy, PartialEq)]
-        enum TargetValidity {
-            /// Generate only valid histories
-            ForceValid,
-            /// Generate only invalid histories with injected anomalies
-            ForceInvalid,
-        }
-
-        /// Configuration for history generation
         #[derive(Debug, Clone)]
         struct GenConfig {
-            /// Total number of operations (invokes + oks)
-            ops_total: usize,
-            /// Number of concurrent processes
+            /// Scheduler steps; each invokes, applies, or completes one op.
+            steps: usize,
+            /// Concurrent client slots. A crashed slot continues under a new pid.
             processes: usize,
-            /// Element pool size
-            elements: usize,
-            /// Proportion of adds vs reads (0.0 = all reads, 1.0 = all adds)
+            /// Probability that a new op is an add rather than a read.
             add_ratio: f64,
-            /// Probability of overlapping operations (0.0 = sequential, 1.0 = maximum overlap)
-            concurrency: f64,
-            /// Target validity for the generated history
-            target_validity: TargetValidity,
-            /// Burstiness: probability of clustering operations (0.0 = uniform, 1.0 = clustered)
-            burstiness: f64,
+            /// Probability that an add re-adds an existing element.
+            readd_ratio: f64,
+            /// Probability that an add fails before taking effect.
+            fail_ratio: f64,
+            /// Probability that an op completes with `Info`.
+            crash_ratio: f64,
         }
 
-        impl GenConfig {
-            fn high_concurrency() -> Self {
-                GenConfig {
-                    ops_total: 2000,
-                    processes: 64,
-                    elements: 50,
-                    add_ratio: 0.5,
-                    concurrency: 0.9,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.1,
-                }
-            }
-
-            fn sequential() -> Self {
-                GenConfig {
-                    ops_total: 1500,
-                    processes: 4,
-                    elements: 30,
-                    add_ratio: 0.5,
-                    concurrency: 0.0,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.1,
-                }
-            }
-
-            fn bursty() -> Self {
-                GenConfig {
-                    ops_total: 2000,
-                    processes: 16,
-                    elements: 40,
-                    add_ratio: 0.5,
-                    concurrency: 0.5,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.9,
-                }
-            }
-
-            fn read_heavy() -> Self {
-                GenConfig {
-                    ops_total: 2000,
-                    processes: 16,
-                    elements: 30,
-                    add_ratio: 0.1,
-                    concurrency: 0.5,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.1,
-                }
-            }
-
-            fn write_heavy() -> Self {
-                GenConfig {
-                    ops_total: 2000,
-                    processes: 16,
-                    elements: 100,
-                    add_ratio: 0.9,
-                    concurrency: 0.5,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.1,
-                }
-            }
-        }
-
-        /// Intermediate representation for operation skeleton
         #[derive(Debug, Clone)]
-        enum SkelOp {
-            AddInvoke { process: u64, elem: i32 },
-            AddOk { process: u64, elem: i32 },
-            ReadInvoke { process: u64, read_id: usize },
-            ReadOk { process: u64, read_id: usize },
+        enum Phase {
+            Idle,
+            AddInvoked(i32),
+            AddApplied(i32),
+            ReadInvoked,
+            ReadApplied(Vec<i32>),
         }
 
-        /// Generate operation skeleton with controlled overlap
-        fn gen_skeleton(config: &GenConfig, rng: &mut impl Rng) -> Vec<SkelOp> {
+        /// Generates a linearizable history by running a sequential set model.
+        /// Each op takes effect at a scheduler step strictly between its invocation
+        /// and completion; pending ops may or may not have taken effect.
+        fn gen_linearizable(config: &GenConfig, seed: u64) -> Vec<Op<i32>> {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut set: BTreeSet<i32> = BTreeSet::new();
+            let mut added: Vec<i32> = Vec::new();
+            let mut slots: Vec<(u64, Phase)> = (0..config.processes as u64)
+                .map(|pid| (pid, Phase::Idle))
+                .collect();
+            let mut next_pid = config.processes as u64;
             let mut ops = Vec::new();
-            let mut inflight: HashMap<u64, Option<SkelOp>> = HashMap::new();
-            let mut next_read_id = 0;
-            let mut epoch_add_ratio = config.add_ratio;
-            let epoch_length = if config.burstiness > 0.5 {
-                100
-            } else {
-                config.ops_total
-            };
 
-            for i in 0..config.ops_total {
-                // Update add_ratio for bursty behavior
-                if config.burstiness > 0.5 && i % epoch_length == 0 {
-                    epoch_add_ratio = if rng.random_bool(0.5) {
-                        rng.random_range(0.0..0.3)
-                    } else {
-                        rng.random_range(0.7..1.0)
-                    };
-                }
-
-                // Choose process (with burstiness, favor recent processes)
-                let process = if config.burstiness > 0.5
-                    && !inflight.is_empty()
-                    && rng.random_bool(config.burstiness)
-                {
-                    *inflight.keys().choose(rng).unwrap()
-                } else {
-                    rng.random_range(0..config.processes) as u64
+            for _ in 0..config.steps {
+                let slot = rng.random_range(0..slots.len());
+                let (pid, phase) = slots[slot].clone();
+                let index = ops.len();
+                let crash = rng.random_bool(config.crash_ratio);
+                let (emitted, next) = match phase {
+                    Phase::Idle if rng.random_bool(config.add_ratio) => {
+                        let element = match added.choose(&mut rng) {
+                            Some(&e) if rng.random_bool(config.readd_ratio) => e,
+                            _ => added.len() as i32,
+                        };
+                        added.push(element);
+                        (
+                            Some(Op::add_invoke(index, pid, element)),
+                            Phase::AddInvoked(element),
+                        )
+                    }
+                    Phase::Idle => (Some(Op::read_invoke(index, pid)), Phase::ReadInvoked),
+                    Phase::AddInvoked(element) if rng.random_bool(config.fail_ratio) => {
+                        (Some(Op::add_fail(index, pid, element)), Phase::Idle)
+                    }
+                    Phase::AddInvoked(element) | Phase::AddApplied(element) if crash => {
+                        (Some(Op::add_info(index, pid, element)), Phase::Idle)
+                    }
+                    Phase::AddInvoked(element) => {
+                        set.insert(element);
+                        (None, Phase::AddApplied(element))
+                    }
+                    Phase::AddApplied(element) => {
+                        (Some(Op::add_ok(index, pid, element)), Phase::Idle)
+                    }
+                    Phase::ReadInvoked | Phase::ReadApplied(_) if crash => {
+                        (Some(Op::read_info(index, pid)), Phase::Idle)
+                    }
+                    Phase::ReadInvoked => (None, Phase::ReadApplied(set.iter().copied().collect())),
+                    Phase::ReadApplied(state) => {
+                        (Some(Op::read_ok(index, pid, state)), Phase::Idle)
+                    }
                 };
-
-                // Check if this process has an inflight operation
-                let has_inflight = inflight.get(&process).and_then(|x| x.as_ref()).is_some();
-
-                // Decide whether to complete existing operation or start new one
-                let should_complete = has_inflight
-                    && (config.concurrency == 0.0 || rng.random_bool(1.0 - config.concurrency));
-
-                if should_complete {
-                    // Complete the inflight operation
-                    if let Some(Some(inflight_op)) = inflight.get(&process) {
-                        match inflight_op {
-                            SkelOp::AddInvoke { process, elem } => {
-                                ops.push(SkelOp::AddOk {
-                                    process: *process,
-                                    elem: *elem,
-                                });
-                            }
-                            SkelOp::ReadInvoke { process, read_id } => {
-                                ops.push(SkelOp::ReadOk {
-                                    process: *process,
-                                    read_id: *read_id,
-                                });
-                            }
-                            _ => unreachable!(),
-                        }
-                        inflight.insert(process, None);
+                if let Some(op) = emitted {
+                    if op.op_type == OpType::Info {
+                        next_pid += 1;
+                        slots[slot].0 = next_pid;
                     }
-                } else {
-                    // Start new operation
-                    let is_add = rng.random_bool(epoch_add_ratio);
-                    if is_add {
-                        let elem = rng.random_range(0..config.elements) as i32;
-                        ops.push(SkelOp::AddInvoke { process, elem });
-                        inflight.insert(process, Some(SkelOp::AddInvoke { process, elem }));
-                    } else {
-                        let read_id = next_read_id;
-                        next_read_id += 1;
-                        ops.push(SkelOp::ReadInvoke { process, read_id });
-                        inflight.insert(process, Some(SkelOp::ReadInvoke { process, read_id }));
-                    }
+                    ops.push(op.at_millis(index as u64));
                 }
+                slots[slot].1 = next;
             }
-
-            // Complete all remaining inflight operations
-            for (_process, inflight_op) in inflight.iter() {
-                if let Some(op) = inflight_op {
-                    match op {
-                        SkelOp::AddInvoke { process, elem } => {
-                            ops.push(SkelOp::AddOk {
-                                process: *process,
-                                elem: *elem,
-                            });
-                        }
-                        SkelOp::ReadInvoke { process, read_id } => {
-                            ops.push(SkelOp::ReadOk {
-                                process: *process,
-                                read_id: *read_id,
-                            });
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-
             ops
         }
 
-        /// Assign read results based on visibility state
-        fn assign_reads(
-            skeleton: &[SkelOp],
-            config: &GenConfig,
-            rng: &mut impl Rng,
-        ) -> Vec<TestOp> {
-            // First pass: track which operations are inflight at each point
-            let mut read_invoke_idx: HashMap<usize, usize> = HashMap::new(); // read_id -> index of read_invoke
-            let mut read_ok_idx: HashMap<usize, usize> = HashMap::new(); // read_id -> index of read_ok
-            let mut add_invoke_idx: HashMap<i32, Vec<usize>> = HashMap::new(); // elem -> indices of add_invokes
-            let mut add_ok_idx: HashMap<i32, Vec<usize>> = HashMap::new(); // elem -> indices of add_oks
-
-            for (idx, op) in skeleton.iter().enumerate() {
-                match op {
-                    SkelOp::AddInvoke { elem, .. } => {
-                        add_invoke_idx.entry(*elem).or_default().push(idx);
-                    }
-                    SkelOp::AddOk { elem, .. } => {
-                        add_ok_idx.entry(*elem).or_default().push(idx);
-                    }
-                    SkelOp::ReadInvoke { read_id, .. } => {
-                        read_invoke_idx.insert(*read_id, idx);
-                    }
-                    SkelOp::ReadOk { read_id, .. } => {
-                        read_ok_idx.insert(*read_id, idx);
-                    }
-                }
-            }
-
-            // Second pass: determine read results
-            let mut read_results: HashMap<usize, Vec<i32>> = HashMap::new();
-
-            for (read_id, &read_ok_position) in read_ok_idx.iter() {
-                let read_invoke_position = read_invoke_idx[read_id];
-                let mut result = Vec::new();
-
-                // For each element, check if it should be visible
-                for (elem, ok_positions) in add_ok_idx.iter() {
-                    for &ok_pos in ok_positions {
-                        // Element is definitely visible if add_ok happened before read_invoke
-                        let definitely_visible = ok_pos < read_invoke_position;
-
-                        // Element may be visible if operations overlap
-                        let possibly_visible =
-                            ok_pos >= read_invoke_position && ok_pos < read_ok_position;
-
-                        if definitely_visible {
-                            if !result.contains(elem) {
-                                result.push(*elem);
-                            }
-                            break; // One add_ok is enough to make it visible
-                        } else if possibly_visible
-                            && config.target_validity == TargetValidity::ForceValid
-                        {
-                            // For valid histories, randomly include overlapping adds
-                            if rng.random_bool(0.5) && !result.contains(elem) {
-                                result.push(*elem);
-                            }
-                            break;
+        fn config_strategy() -> impl Strategy<Value = GenConfig> {
+            (
+                50usize..600,
+                1usize..16,
+                0.2f64..0.8,
+                0.0f64..0.3,
+                0.0f64..0.1,
+                0.0f64..0.1,
+            )
+                .prop_map(
+                    |(steps, processes, add_ratio, readd_ratio, fail_ratio, crash_ratio)| {
+                        GenConfig {
+                            steps,
+                            processes,
+                            add_ratio,
+                            readd_ratio,
+                            fail_ratio,
+                            crash_ratio,
                         }
-                    }
-                }
-
-                result.sort_unstable();
-                read_results.insert(*read_id, result);
-            }
-
-            // Inject anomalies for invalid histories
-            if config.target_validity == TargetValidity::ForceInvalid {
-                let completed_adds: HashSet<i32> = add_ok_idx.keys().copied().collect();
-                inject_anomalies(&mut read_results, &completed_adds, rng);
-            }
-
-            // Convert skeleton to TestOp with read results
-            let mut final_result = Vec::new();
-            for op in skeleton.iter() {
-                match op {
-                    SkelOp::AddInvoke { process, elem } => {
-                        final_result.push(TestOp::AddInvoke(*process, *elem));
-                    }
-                    SkelOp::AddOk { process, elem } => {
-                        final_result.push(TestOp::AddOk(*process, *elem));
-                    }
-                    SkelOp::ReadInvoke { process, .. } => {
-                        final_result.push(TestOp::ReadInvoke(*process));
-                    }
-                    SkelOp::ReadOk { process, read_id } => {
-                        let result_vec = read_results.get(read_id).cloned().unwrap_or_default();
-                        final_result.push(TestOp::ReadOk(*process, result_vec));
-                    }
-                }
-            }
-
-            final_result
+                    },
+                )
         }
 
-        /// Inject anomalies into read results to create invalid histories
-        fn inject_anomalies(
-            read_results: &mut HashMap<usize, Vec<i32>>,
-            completed_adds: &HashSet<i32>,
-            rng: &mut impl Rng,
-        ) {
-            if read_results.is_empty() || completed_adds.is_empty() {
-                return;
-            }
+        fn read_value(op: &Op<i32>) -> &[i32] {
+            op.value.as_vec().expect("generated reads return a Vec")
+        }
 
-            // Find reads that actually contain elements
-            let non_empty_reads: Vec<usize> = read_results
-                .iter()
-                .filter(|(_, v)| !v.is_empty())
-                .map(|(k, _)| *k)
+        /// Positions of successful reads and their invocations.
+        fn successful_reads(ops: &[Op<i32>]) -> Vec<(usize, usize)> {
+            let history = History::from_ops(ops.to_vec()).unwrap();
+            (0..ops.len())
+                .filter(|&pos| ops[pos].f == OpFn::Read && ops[pos].op_type == OpType::Ok)
+                .map(|pos| (history.invocation(pos).unwrap().index, pos))
+                .collect()
+        }
+
+        /// Removes from some read an element whose add completed before the read
+        /// was invoked. Returns `None` if no read has such an element.
+        fn inject_stale_read(ops: &mut [Op<i32>], rng: &mut impl Rng) -> Option<()> {
+            let candidates: Vec<(usize, i32)> = successful_reads(ops)
+                .into_iter()
+                .flat_map(|(invoked, pos)| {
+                    ops[..invoked]
+                        .iter()
+                        .filter(|op| op.f == OpFn::Add && op.op_type == OpType::Ok)
+                        .map(move |op| (pos, *op.value.as_single().unwrap()))
+                })
                 .collect();
-
-            if non_empty_reads.is_empty() {
-                // If no reads have elements, inject a "never appears" anomaly
-                // by adding an element to the first read that should have it
-                if let Some((_read_id, result)) = read_results.iter_mut().next() {
-                    if let Some(&elem) = completed_adds.iter().next() {
-                        result.push(elem);
-                        result.sort_unstable();
-                    }
-                }
-                return;
-            }
-
-            let anomaly_type = rng.random_range(0..2);
-            match anomaly_type {
-                0 => {
-                    // Lost element: find a read with elements and remove one that should be there
-                    let &target_read = non_empty_reads.choose(rng).unwrap();
-                    let result = read_results.get_mut(&target_read).unwrap();
-                    if !result.is_empty() {
-                        let idx = rng.random_range(0..result.len());
-                        result.remove(idx);
-                    }
-                }
-                1 => {
-                    // Stale read: remove element from early reads but keep in later ones
-                    let mut read_ids: Vec<usize> = read_results.keys().copied().collect();
-                    read_ids.sort_unstable();
-
-                    if read_ids.len() >= 2 {
-                        // Find an element that appears in multiple reads
-                        let mut elem_to_remove = None;
-                        for &elem in completed_adds.iter() {
-                            let count = read_results.values().filter(|v| v.contains(&elem)).count();
-                            if count >= 2 {
-                                elem_to_remove = Some(elem);
-                                break;
-                            }
-                        }
-
-                        if let Some(elem) = elem_to_remove {
-                            // Remove from first half of reads, keep in second half
-                            let mid = read_ids.len() / 2;
-                            for read_id in read_ids.iter().take(mid) {
-                                let result = read_results.get_mut(read_id).unwrap();
-                                result.retain(|e| *e != elem);
-                            }
-                        } else {
-                            // Fallback: just remove an element from one read
-                            let &target_read = non_empty_reads.choose(rng).unwrap();
-                            let result = read_results.get_mut(&target_read).unwrap();
-                            if !result.is_empty() {
-                                let idx = rng.random_range(0..result.len());
-                                result.remove(idx);
-                            }
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
+            let &(pos, element) = candidates.choose(rng)?;
+            let state = read_value(&ops[pos])
+                .iter()
+                .copied()
+                .filter(|&e| e != element);
+            ops[pos].value = OpValue::Vec(state.collect());
+            Some(())
         }
 
-        /// Generate a complete history based on configuration
-        fn gen_history(config: GenConfig, seed: u64) -> Vec<TestOp> {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let skeleton = gen_skeleton(&config, &mut rng);
-            assign_reads(&skeleton, &config, &mut rng)
+        /// Adds to some read an element whose every non-failed add was invoked
+        /// after the read completed. Returns `None` if there is no such pair.
+        fn inject_future_read(ops: &mut [Op<i32>], rng: &mut impl Rng) -> Option<()> {
+            let history = History::from_ops(ops.to_vec()).unwrap();
+            let mut first_attempt: Vec<(i32, usize)> = Vec::new();
+            for (pos, op) in ops.iter().enumerate() {
+                let failed = history.completion(pos).map(|c| c.op_type) == Some(OpType::Fail);
+                if op.f == OpFn::Add && op.op_type == OpType::Invoke && !failed {
+                    let element = *op.value.as_single().unwrap();
+                    if !first_attempt.iter().any(|(e, _)| *e == element) {
+                        first_attempt.push((element, op.index));
+                    }
+                }
+            }
+            let candidates: Vec<(usize, i32)> = successful_reads(ops)
+                .into_iter()
+                .flat_map(|(_, pos)| {
+                    first_attempt
+                        .iter()
+                        .filter(move |(_, invoked)| *invoked > pos)
+                        .map(move |(element, _)| (pos, *element))
+                })
+                .collect();
+            let &(pos, element) = candidates.choose(rng)?;
+            let mut state = read_value(&ops[pos]).to_vec();
+            state.push(element);
+            ops[pos].value = OpValue::Vec(state);
+            Some(())
+        }
+
+        /// Asserts that every edge of `cycle` is a fact about `history` and the
+        /// edges close into a cycle, so the cycle proves non-linearizability.
+        fn assert_proves_violation(history: &History<i32>, cycle: &PrecedenceCycle<i32>) {
+            let ops = history.ops();
+            let read_state = |event: &Event<i32>| match event {
+                Event::Read { complete_index, .. } => {
+                    let op = ops.iter().find(|op| op.index == *complete_index).unwrap();
+                    read_value(op).to_vec()
+                }
+                Event::Add(_) => panic!("expected a read, got {event:?}"),
+            };
+            let add_bounds = |element: i32| {
+                let mut start = None;
+                let mut end = None;
+                for (pos, op) in ops.iter().enumerate() {
+                    if op.f != OpFn::Add
+                        || op.op_type != OpType::Invoke
+                        || op.value.as_single() != Some(&element)
+                    {
+                        continue;
+                    }
+                    let completion = history.completion(pos);
+                    if completion.is_some_and(|c| c.op_type == OpType::Fail) {
+                        continue;
+                    }
+                    start = start.or(Some(op.index));
+                    if let Some(c) = completion.filter(|c| c.op_type == OpType::Ok) {
+                        end = Some(end.map_or(c.index, |e: usize| e.min(c.index)));
+                    }
+                }
+                (start, end)
+            };
+
+            let edges = &cycle.edges;
+            assert!(!edges.is_empty());
+            for (i, edge) in edges.iter().enumerate() {
+                assert_eq!(edge.after, edges[(i + 1) % edges.len()].before, "{cycle:?}");
+                match edge.reason {
+                    Reason::Observed => {
+                        let Event::Add(element) = edge.before else {
+                            panic!("{edge:?}")
+                        };
+                        assert!(read_state(&edge.after).contains(&element), "{edge:?}");
+                    }
+                    Reason::Missed => {
+                        let Event::Add(element) = edge.after else {
+                            panic!("{edge:?}")
+                        };
+                        assert!(!read_state(&edge.before).contains(&element), "{edge:?}");
+                        let observed = ops.iter().any(|op| {
+                            op.f == OpFn::Read
+                                && op.op_type == OpType::Ok
+                                && read_value(op).contains(&element)
+                        });
+                        assert!(observed || add_bounds(element).1.is_some(), "{edge:?}");
+                    }
+                    Reason::RealTime {
+                        completed_index,
+                        invoked_index,
+                    } => {
+                        assert!(completed_index < invoked_index, "{edge:?}");
+                        let completed = match edge.before {
+                            Event::Read { complete_index, .. } => Some(complete_index),
+                            Event::Add(element) => add_bounds(element).1,
+                        };
+                        let invoked = match edge.after {
+                            Event::Read { invoke_index, .. } => Some(invoke_index),
+                            Event::Add(element) => add_bounds(element).0,
+                        };
+                        assert_eq!(completed, Some(completed_index), "{edge:?}");
+                        assert_eq!(invoked, Some(invoked_index), "{edge:?}");
+                    }
+                }
+            }
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(20))]
+            #![proptest_config(ProptestConfig::with_cases(64))]
 
             #[test]
-            fn prop_valid_histories_pass(
-                ops_total in 1000usize..3000,
-                processes in 2usize..32,
-                elements in 10usize..100,
-                add_ratio in 0.1f64..0.9,
-                concurrency in 0.0f64..0.8,
-                seed in any::<u64>(),
-            ) {
-                let config = GenConfig {
-                    ops_total,
-                    processes,
-                    elements,
-                    add_ratio,
-                    concurrency,
-                    target_validity: TargetValidity::ForceValid,
-                    burstiness: 0.1,
-                };
-                let history = gen_history(config, seed);
-                let history_len = history.len();
-                let result = check(history);
+            fn prop_linearizable_histories_pass(config in config_strategy(), seed in any::<u64>()) {
+                let history = History::from_ops(gen_linearizable(&config, seed)).unwrap();
+                let result = SetFullChecker::linearizable().check(&history);
 
-                // Valid histories should not be marked as invalid
-                prop_assert_ne!(
-                    result.valid,
-                    Validity::Invalid,
-                    "Valid history marked as invalid. History length: {}, Stable: {}, Lost: {}, Stale: {}",
-                    history_len,
-                    result.stable_count,
-                    result.lost_count,
-                    result.stale_count
-                );
+                prop_assert_eq!(result.linearizability_violation, None);
+                prop_assert_ne!(result.valid, Validity::Invalid);
+                prop_assert_eq!(result.stale_count, 0);
+                prop_assert_eq!(result.lost_count, 0);
             }
 
             #[test]
-            fn prop_invalid_histories_fail(
-                ops_total in 1000usize..2000,
-                processes in 2usize..8,
-                elements in 10usize..30,
-                add_ratio in 0.4f64..0.6,
-                concurrency in 0.0f64..0.3,
-                seed in any::<u64>(),
-            ) {
-                let config = GenConfig {
-                    ops_total,
-                    processes,
-                    elements,
-                    add_ratio,
-                    concurrency,
-                    target_validity: TargetValidity::ForceInvalid,
-                    burstiness: 0.1,
-                };
-                let history = gen_history(config, seed);
-                let result = check(history);
+            fn prop_stale_reads_detected(config in config_strategy(), seed in any::<u64>()) {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let mut ops = gen_linearizable(&config, seed);
+                prop_assume!(inject_stale_read(&mut ops, &mut rng).is_some());
+                let history = History::from_ops(ops).unwrap();
 
-                // Anomaly injection is best-effort; with overlapping operations some
-                // anomalies may not be detectable. We verify the result is internally consistent.
-                prop_assert!(result.stable_count + result.lost_count + result.never_read_count <= result.attempt_count);
+                let eventual = SetFullChecker::default().check(&history);
+                prop_assert!(eventual.stale_count + eventual.lost_count > 0);
+
+                let result = SetFullChecker::linearizable().check(&history);
+                prop_assert_eq!(result.valid, Validity::Invalid);
+                assert_proves_violation(&history, result.linearizability_violation.as_ref().unwrap());
+            }
+
+            #[test]
+            fn prop_future_reads_detected(config in config_strategy(), seed in any::<u64>()) {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let mut ops = gen_linearizable(&config, seed);
+                prop_assume!(inject_future_read(&mut ops, &mut rng).is_some());
+                let history = History::from_ops(ops).unwrap();
+
+                let result = SetFullChecker::linearizable().check(&history);
+                prop_assert_eq!(result.valid, Validity::Invalid);
+                assert_proves_violation(&history, result.linearizability_violation.as_ref().unwrap());
             }
         }
 
+        /// The same seed must produce the same history, so failures reproduce.
         #[test]
-        fn test_generated_invalid_sequential() {
-            // Generate a sequential (low concurrency) invalid history
-            // With no concurrency, anomalies should be easily detectable
+        fn test_generator_deterministic() {
             let config = GenConfig {
-                ops_total: 1000,
-                processes: 4,
-                elements: 20,
+                steps: 500,
+                processes: 8,
                 add_ratio: 0.5,
-                concurrency: 0.0, // Sequential - no overlap
-                target_validity: TargetValidity::ForceInvalid,
-                burstiness: 0.0,
+                readd_ratio: 0.2,
+                fail_ratio: 0.05,
+                crash_ratio: 0.05,
             };
-            let history = gen_history(config, 12345);
-            let result = check(history);
-
-            // With sequential execution and anomaly injection, we SHOULD detect invalidity
-            assert!(
-                result.valid == Validity::Invalid
-                    || result.lost_count > 0
-                    || result.stale_count > 0,
-                "Sequential invalid history was not detected as invalid. Valid: {:?}, Lost: {}, Stale: {}",
-                result.valid,
-                result.lost_count,
-                result.stale_count
+            let render = |ops: Vec<Op<i32>>| format!("{ops:?}");
+            assert_eq!(
+                render(gen_linearizable(&config, 7)),
+                render(gen_linearizable(&config, 7))
             );
-        }
-
-        #[test]
-        fn test_deterministic_invalid_history() {
-            // Create a simple, deterministic invalid history:
-            // Add element 1, read sees it, then another read doesn't see it (lost element)
-            let ops = vec![
-                // Process 0 adds element 1
-                TestOp::AddInvoke(0, 1),
-                TestOp::AddOk(0, 1),
-                // Process 1 reads and sees element 1
-                TestOp::ReadInvoke(1),
-                TestOp::ReadOk(1, vec![1]),
-                // Process 2 reads but doesn't see element 1 (invalid - lost element)
-                TestOp::ReadInvoke(2),
-                TestOp::ReadOk(2, vec![]), // Lost element 1
-            ];
-
-            let result = check(ops);
-
-            // This should be detected as invalid with a lost element
-            assert_eq!(result.valid, Validity::Invalid);
-            assert_eq!(result.lost_count, 1);
-            assert!(result.lost.contains(&1));
-        }
-
-        #[test]
-        fn test_high_concurrency_scenario() {
-            let config = GenConfig::high_concurrency();
-            let history = gen_history(config, 42);
-            let history_len = history.len();
-            let result = check(history);
-
-            assert_ne!(result.valid, Validity::Invalid);
-            assert!(history_len >= 2000);
-        }
-
-        #[test]
-        fn test_sequential_scenario() {
-            let config = GenConfig::sequential();
-            let history = gen_history(config, 42);
-            let history_len = history.len();
-            let result = check(history);
-
-            assert_ne!(result.valid, Validity::Invalid);
-            assert!(history_len >= 1500);
-        }
-
-        #[test]
-        fn test_bursty_scenario() {
-            let config = GenConfig::bursty();
-            let history = gen_history(config, 42);
-            let history_len = history.len();
-            let result = check(history);
-
-            assert_ne!(result.valid, Validity::Invalid);
-            assert!(history_len >= 2000);
-        }
-
-        #[test]
-        fn test_read_heavy_scenario() {
-            let config = GenConfig::read_heavy();
-            let history = gen_history(config, 42);
-
-            // Count read operations
-            let read_count = history
-                .iter()
-                .filter(|op| matches!(op, TestOp::ReadInvoke(_)))
-                .count();
-            let add_count = history
-                .iter()
-                .filter(|op| matches!(op, TestOp::AddInvoke(_, _)))
-                .count();
-
-            let result = check(history);
-
-            assert_ne!(result.valid, Validity::Invalid);
-            assert!(read_count > add_count * 5);
-        }
-
-        #[test]
-        fn test_write_heavy_scenario() {
-            let config = GenConfig::write_heavy();
-            let history = gen_history(config, 42);
-
-            // Count add operations
-            let add_count = history
-                .iter()
-                .filter(|op| matches!(op, TestOp::AddInvoke(_, _)))
-                .count();
-            let read_count = history
-                .iter()
-                .filter(|op| matches!(op, TestOp::ReadInvoke(_)))
-                .count();
-
-            let result = check(history);
-
-            assert_ne!(result.valid, Validity::Invalid);
-            assert!(add_count > read_count * 5);
         }
     }
 }
