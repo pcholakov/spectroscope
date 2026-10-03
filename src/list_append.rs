@@ -20,6 +20,15 @@
 //! [`ListAppendChecker`] reports two kinds of evidence: anomalies visible
 //! without a dependency graph (see [`Anomaly`]), and cycles in the dependency
 //! graph that rule out the chosen [`ConsistencyModel`] (see [`Cycle`]).
+//!
+//! # Reading the results
+//!
+//! - One cause can appear as both kinds, as in Elle: a lost update is also a
+//!   `G2-item` cycle, and a dirty update comes with the `G1a` read that showed
+//!   the failed value.
+//! - A key's version order is its longest committed read. When reads of the key
+//!   disagree (`incompatible-order`), cycle steps on that key follow the longest
+//!   read and may contradict the others.
 
 use crate::Validity;
 use crate::history::{History, Op, OpType, Operation, Pid};
@@ -29,7 +38,9 @@ mod dependency;
 mod txns;
 
 pub use anomaly::{Anomaly, Expected};
-pub use dependency::{ConsistencyModel, Cycle, Dependency, Step};
+pub use dependency::{
+    ConsistencyModel, Cycle, CycleAnomaly, DataCycle, Dependency, OrderEdge, Step,
+};
 
 /// One step of a list-append transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,12 +379,25 @@ mod tests {
         }
     }
 
+    fn wr(from: TxnRef, to: TxnRef, key: &'static str, value: u32) -> Step<&'static str, u32> {
+        let dependency = Dependency::WriteRead { key, value };
+        Step {
+            from,
+            to,
+            dependency,
+        }
+    }
+
+    /// Asserts the result's only evidence is one cycle named `name` with `steps`.
     fn assert_single_cycle(
         result: &ListAppendResult<&'static str, u32>,
-        steps: Vec<Step<&'static str, u32>>,
+        name: &str,
+        steps: &[Step<&'static str, u32>],
     ) {
         assert_eq!(result.anomalies, []);
-        assert_eq!(result.cycles, [Cycle { steps }]);
+        assert_eq!(result.cycles.len(), 1, "{:?}", result.cycles);
+        assert_eq!(result.cycles[0].anomaly.name(), name);
+        assert_eq!(result.cycles[0].steps, steps);
         assert_eq!(result.valid, Validity::Invalid);
     }
 
@@ -386,7 +410,8 @@ mod tests {
         b.committed(2, &[read_result("x", &[1, 3])]);
         b.committed(3, &[read_result("y", &[4, 2])]);
         let steps = vec![ww(t0, t1, "x", 1, 3), ww(t1, t0, "y", 4, 2)];
-        assert_single_cycle(&b.check_against(ConsistencyModel::Serializable), steps);
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G0", &steps);
     }
 
     /// Write skew: each transaction read the empty list the other appended to.
@@ -396,7 +421,55 @@ mod tests {
         let t0 = b.committed(0, &[read_result("x", &[]), append("y", 1)]);
         let t1 = b.committed(1, &[read_result("y", &[]), append("x", 2)]);
         let steps = vec![rw(t0, t1, "x", None, 2), rw(t1, t0, "y", None, 1)];
-        assert_single_cycle(&b.check_against(ConsistencyModel::Serializable), steps);
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G2-item", &steps);
+    }
+
+    /// T1 appended after T0, and T0 read T1's append.
+    #[test]
+    fn test_write_read_cycle() {
+        let mut b = Builder::default();
+        let t0 = b.committed(0, &[append("x", 1), read_result("y", &[3])]);
+        let t1 = b.committed(1, &[append("x", 2), append("y", 3)]);
+        b.committed(2, &[read_result("x", &[1, 2])]);
+        let steps = vec![ww(t0, t1, "x", 1, 2), wr(t1, t0, "y", 3)];
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G1c", &steps);
+    }
+
+    /// The anti-dependencies are adjacent only across the cycle's last and first
+    /// steps, which still makes it G2.
+    #[test]
+    fn test_read_writes_adjacent_across_cycle_start() {
+        let mut b = Builder::default();
+        let t0 = b.committed(0, &[read_result("x", &[]), append("z", 2)]);
+        let t1 = b.committed(1, &[append("x", 1), append("y", 5)]);
+        let t2 = b.committed(2, &[read_result("y", &[5]), read_result("z", &[])]);
+        let steps = vec![
+            rw(t0, t1, "x", None, 1),
+            wr(t1, t2, "y", 5),
+            rw(t2, t0, "z", None, 2),
+        ];
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G2-item", &steps);
+    }
+
+    /// Two anti-dependencies separated by write-read dependencies.
+    #[test]
+    fn test_nonadjacent_read_write_cycle() {
+        let mut b = Builder::default();
+        let t0 = b.committed(0, &[read_result("x", &[]), read_result("z", &[3])]);
+        let t1 = b.committed(1, &[append("x", 1), append("y", 5)]);
+        let t2 = b.committed(2, &[read_result("y", &[5]), read_result("w", &[])]);
+        let t3 = b.committed(3, &[append("w", 4), append("z", 3)]);
+        let steps = vec![
+            rw(t0, t1, "x", None, 1),
+            wr(t1, t2, "y", 5),
+            rw(t2, t3, "w", None, 4),
+            wr(t3, t0, "z", 3),
+        ];
+        let result = b.check_against(ConsistencyModel::Serializable);
+        assert_single_cycle(&result, "G-nonadjacent-item", &steps);
     }
 
     /// A read invoked after an append completed misses it: serializable with the
@@ -429,10 +502,8 @@ mod tests {
             },
         };
         let steps = vec![real_time, rw(reader, writer, "x", None, 1)];
-        assert_single_cycle(
-            &b.check_against(ConsistencyModel::StrictSerializable),
-            steps,
-        );
+        let result = b.check_against(ConsistencyModel::StrictSerializable);
+        assert_single_cycle(&result, "G-single-item-realtime", &steps);
 
         let (b, writer, reader) = stale_read(0);
         let process = Step {
@@ -442,7 +513,27 @@ mod tests {
         };
         let steps = vec![process, rw(reader, writer, "x", None, 1)];
         let result = b.check_against(ConsistencyModel::StrongSessionSerializable);
-        assert_single_cycle(&result, steps);
+        assert_single_cycle(&result, "G-single-item-process", &steps);
+    }
+
+    /// A real-time step through several time nodes counts as one step, so the
+    /// two-step stale read wins over a three-step chain of reads.
+    #[test]
+    fn test_shortest_cycle_counts_real_time_as_one_step() {
+        let mut b = Builder::default();
+        let writer = b.committed(0, &[append("x", 1), append("y", 2)]);
+        b.committed(1, &[read_result("y", &[2]), append("z", 3)]);
+        let reader = b.committed(2, &[read_result("z", &[3]), read_result("x", &[])]);
+        let real_time = Step {
+            from: writer,
+            to: reader,
+            dependency: Dependency::RealTime {
+                completed_index: 1,
+                invoked_index: 4,
+            },
+        };
+        let steps = vec![real_time, rw(reader, writer, "x", None, 1)];
+        assert_single_cycle(&b.check(), "G-single-item-realtime", &steps);
     }
 
     /// An append no read observed still follows every observed value, so a read
@@ -463,7 +554,7 @@ mod tests {
             },
         };
         let steps = vec![real_time, rw(reader, writer, "x", Some(1), 2)];
-        assert_single_cycle(&b.check(), steps);
+        assert_single_cycle(&b.check(), "G-single-item-realtime", &steps);
     }
 
     #[test]
@@ -614,7 +705,17 @@ mod tests {
             read: vec![1],
             txns: vec![first, second],
         };
-        assert_invalid(&b.check(), &[expected]);
+        let result = b.check();
+        assert_invalid(&result, &[expected]);
+        // Neither append was observed, and each transaction read the state the
+        // other appended after: the same root cause as a G2-item cycle.
+        let steps = vec![
+            rw(first, second, "x", Some(1), 3),
+            rw(second, first, "x", Some(1), 2),
+        ];
+        assert_eq!(result.cycles.len(), 1);
+        assert_eq!(result.cycles[0].anomaly.name(), "G2-item");
+        assert_eq!(result.cycles[0].steps, steps);
     }
 
     #[test]

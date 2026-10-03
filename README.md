@@ -109,7 +109,11 @@ of evidence, using Elle's names and definitions so results can be compared:
 - **Cycles in the dependency graph:** write-write, write-read and read-write
   dependencies inferred from the lists reads returned, plus process order for strong
   session serializability or real-time order for strict serializability. Each
-  strongly connected component yields one shortest cycle, with every step explained.
+  strongly connected component yields one shortest cycle, with every step explained,
+  named after Elle's classes: `G0`, `G1c`, `G-single-item`, `G-nonadjacent-item` or
+  `G2-item`, with a `-process` or `-realtime` suffix when such edges take part. Elle
+  searches each component for its weakest anomaly first; this checker names the
+  shortest cycle it finds, so the two can name a component differently.
 
 A history with neither is `Valid`. Duplicate appends make it `Unknown`, since reads can
 no longer be attributed to one writer.

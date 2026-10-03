@@ -52,8 +52,8 @@ pub mod set_full;
 
 pub use history::{History, HistoryError, Op, OpType, Operation, Pid, Timestamp};
 pub use list_append::{
-    Anomaly, ConsistencyModel, Cycle, Dependency, ListAppendChecker, ListAppendResult, MicroOp,
-    Step, Txn, TxnRef,
+    Anomaly, ConsistencyModel, Cycle, CycleAnomaly, DataCycle, Dependency, ListAppendChecker,
+    ListAppendResult, MicroOp, OrderEdge, Step, Txn, TxnRef,
 };
 pub use set_full::{
     ElementOutcome, Event, Precedence, PrecedenceCycle, Reason, SetFullChecker, SetFullOptions,

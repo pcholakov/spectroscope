@@ -27,6 +27,10 @@
 //! a transaction reaches another through time nodes exactly when it completed
 //! before the other was invoked, with O(transactions) edges. An indeterminate
 //! transaction never completes, so real time gives it no outgoing edges.
+//!
+//! Each strongly connected component is reported as one shortest cycle, named by
+//! the dependencies on it. Elle instead searches each component for cycles of
+//! its weakest anomaly first, so it may name the same component differently.
 
 use std::collections::BTreeMap;
 
@@ -111,8 +115,108 @@ pub struct Step<K, V> {
 /// `from`, and the last step's `to` is the first step's `from`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cycle<K, V> {
+    /// The anomaly the steps' dependencies make this cycle.
+    pub anomaly: CycleAnomaly,
     /// The steps, in cycle order.
     pub steps: Vec<Step<K, V>>,
+}
+
+/// Elle's classification of a dependency cycle, after Adya's phenomena. All
+/// dependencies here are on items, not predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleAnomaly {
+    /// The class the data dependencies alone determine.
+    pub data: DataCycle,
+    /// The strongest ordering edge in the cycle, if it has any: real time if
+    /// any step is real time, otherwise process if any step is.
+    pub order: Option<OrderEdge>,
+}
+
+/// A cycle's class by its write-write, write-read and read-write dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataCycle {
+    /// Write cycle: only write-write dependencies.
+    G0,
+    /// Circular information flow: write-read dependencies, possibly with
+    /// write-write ones, and no read-write dependency.
+    G1c,
+    /// Single anti-dependency: exactly one read-write dependency.
+    GSingle,
+    /// Two or more read-write dependencies, none consecutive in the cycle.
+    GNonadjacent,
+    /// Two or more read-write dependencies, some consecutive.
+    G2,
+}
+
+/// An ordering dependency that is not a data dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderEdge {
+    /// [`Dependency::Process`].
+    Process,
+    /// [`Dependency::RealTime`].
+    RealTime,
+}
+
+impl CycleAnomaly {
+    /// Elle's name for the anomaly, such as `"G-single-item-realtime"`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        use DataCycle::{G0, G1c, G2, GNonadjacent, GSingle};
+        use OrderEdge::{Process, RealTime};
+        match (self.data, self.order) {
+            (G0, None) => "G0",
+            (G0, Some(Process)) => "G0-process",
+            (G0, Some(RealTime)) => "G0-realtime",
+            (G1c, None) => "G1c",
+            (G1c, Some(Process)) => "G1c-process",
+            (G1c, Some(RealTime)) => "G1c-realtime",
+            (GSingle, None) => "G-single-item",
+            (GSingle, Some(Process)) => "G-single-item-process",
+            (GSingle, Some(RealTime)) => "G-single-item-realtime",
+            (GNonadjacent, None) => "G-nonadjacent-item",
+            (GNonadjacent, Some(Process)) => "G-nonadjacent-item-process",
+            (GNonadjacent, Some(RealTime)) => "G-nonadjacent-item-realtime",
+            (G2, None) => "G2-item",
+            (G2, Some(Process)) => "G2-item-process",
+            (G2, Some(RealTime)) => "G2-item-realtime",
+        }
+    }
+
+    /// Classifies a cycle's steps as Elle does.
+    fn of<K, V>(steps: &[Step<K, V>]) -> Self {
+        let count = |kind: fn(&Dependency<K, V>) -> bool| {
+            steps.iter().filter(|step| kind(&step.dependency)).count()
+        };
+        let is_read_write =
+            |dependency: &Dependency<K, V>| matches!(dependency, Dependency::ReadWrite { .. });
+        let read_writes = count(is_read_write);
+        let write_reads = count(|d| matches!(d, Dependency::WriteRead { .. }));
+        // Process and real-time order both follow invocation order, so a cycle
+        // always contains a data dependency; with no rw or wr, that is ww.
+        assert!(
+            read_writes + write_reads + count(|d| matches!(d, Dependency::WriteWrite { .. })) > 0,
+            "a cycle needs a data dependency"
+        );
+        let adjacent_read_writes = steps
+            .iter()
+            .zip(steps.iter().cycle().skip(1))
+            .any(|(a, b)| is_read_write(&a.dependency) && is_read_write(&b.dependency));
+        let data = match read_writes {
+            1 => DataCycle::GSingle,
+            2.. if adjacent_read_writes => DataCycle::G2,
+            2.. => DataCycle::GNonadjacent,
+            0 if write_reads > 0 => DataCycle::G1c,
+            0 => DataCycle::G0,
+        };
+        let order = if count(|d| matches!(d, Dependency::RealTime { .. })) > 0 {
+            Some(OrderEdge::RealTime)
+        } else if count(|d| matches!(d, Dependency::Process)) > 0 {
+            Some(OrderEdge::Process)
+        } else {
+            None
+        };
+        Self { data, order }
+    }
 }
 
 /// A graph edge. Real time is a chain through time nodes; a [`Cycle`] reports
@@ -573,5 +677,8 @@ fn explain<K: Clone, V: Clone>(
             dependency,
         });
     }
-    Cycle { steps }
+    Cycle {
+        anomaly: CycleAnomaly::of(&steps),
+        steps,
+    }
 }
