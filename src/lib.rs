@@ -45,9 +45,11 @@
 //! make a history invalid without a cycle.
 
 pub mod history;
+pub mod list_append;
 pub mod set_full;
 
 pub use history::{History, HistoryError, Op, OpType, Operation, Pid, Timestamp};
+pub use list_append::{MicroOp, Txn};
 pub use set_full::{
     ElementOutcome, Event, Precedence, PrecedenceCycle, Reason, SetFullChecker, SetFullOptions,
     SetFullResult, SetOp, WorstStaleEntry,
