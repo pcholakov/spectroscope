@@ -97,6 +97,7 @@ pub struct WorstStaleEntry<T> {
 #[derive(Debug, Clone)]
 pub struct SetFullResult<T> {
     pub valid: Validity,
+    /// Distinct elements that were added or observed.
     pub attempt_count: usize,
     pub stable_count: usize,
     pub lost_count: usize,
@@ -116,8 +117,9 @@ pub struct SetFullResult<T> {
     /// Elements returned by a read although no add of them was invoked, or every
     /// add of them failed. Nothing in the history could have written them.
     pub observed_without_add: Vec<T>,
-    /// In linearizable mode, proof that the history is not linearizable.
-    /// Always `None` otherwise.
+    /// In linearizable mode, a cycle proving the history's orderings contradict
+    /// each other. Always `None` otherwise. A history can also be invalid without
+    /// a cycle, through `lost`, `duplicated`, or `observed_without_add`.
     pub linearizability_violation: Option<PrecedenceCycle<T>>,
     /// Raw stable latencies in milliseconds (unsorted).
     stable_latencies: Vec<u64>,
@@ -1559,10 +1561,10 @@ mod tests {
     }
 
     /// Indices are arbitrary increasing `usize`s, so outcomes must not depend on
-    /// them fitting in a signed integer.
+    /// them fitting in a signed integer of the same width.
     #[test]
-    fn test_indices_above_i64_max() {
-        let b = 1usize << 63;
+    fn test_indices_above_isize_max() {
+        let b = isize::MAX as usize + 1;
         let history = History::from_ops([
             Op::read_invoke(0, 0u64),
             Op::add_invoke(1, 1u64, 1),

@@ -40,7 +40,9 @@
 //! - **Never-read**: Element added but no subsequent reads occurred
 //!
 //! Use [`SetFullChecker::linearizable()`] to also decide whether the whole history is
-//! linearizable. A violation comes with a [`PrecedenceCycle`] proving it.
+//! linearizable. When its orderings contradict each other, the result carries a
+//! [`PrecedenceCycle`] proving it. Duplicates, and elements read without any add,
+//! make a history invalid without a cycle.
 
 pub mod history;
 pub mod set_full;

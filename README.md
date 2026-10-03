@@ -77,8 +77,10 @@ entire set at once, so all readers must also agree on a single order in which el
 appeared. For example, two concurrent reads that return `{1}` and `{2}` while both
 adds are in flight have no stale elements, but no single order explains both.
 
-When the history is not linearizable, `result.linearizability_violation` holds a
-cycle of orderings that cannot all hold, for example:
+When the history's orderings contradict each other, `result.linearizability_violation`
+holds a cycle of orderings that cannot all hold. Duplicated elements and elements read
+without any add make a history invalid without a cycle; see `duplicated` and
+`observed_without_add`. An example cycle:
 
 ```text
 Add(1) before Read(2..4)  -- the read observed 1
