@@ -68,7 +68,9 @@ pub struct PrecedenceCycle<T> {
     pub edges: Vec<Precedence<T>>,
 }
 
-/// Returns a cycle proving `history` is not linearizable, or `None` if it is.
+/// Returns a cycle proving `history` is not linearizable, or `None` if no
+/// ordering forbids it. Elements observed without a non-failed add impose no
+/// ordering here; the caller rejects them separately.
 pub(super) fn find_violation<T>(history: &History<T>) -> Option<PrecedenceCycle<T>>
 where
     T: Clone + Eq + Hash + Ord,

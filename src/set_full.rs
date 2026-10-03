@@ -113,8 +113,9 @@ pub struct SetFullResult<T> {
     pub worst_stale: Vec<WorstStaleEntry<T>>,
     /// Elements with duplicates and their max multiplicity.
     pub duplicated: HashMap<T, usize>,
-    /// Elements returned by a read although every add of them failed.
-    pub observed_failed: Vec<T>,
+    /// Elements returned by a read although no add of them was invoked, or every
+    /// add of them failed. Nothing in the history could have written them.
+    pub observed_without_add: Vec<T>,
     /// In linearizable mode, proof that the history is not linearizable.
     /// Always `None` otherwise.
     pub linearizability_violation: Option<PrecedenceCycle<T>>,
@@ -327,9 +328,8 @@ impl SetFullChecker {
     {
         let mut elements: HashMap<T, ElementState<T>> = HashMap::new();
         let mut duplicates: HashMap<T, usize> = HashMap::new();
-        // Elements with an add that did not fail, and elements with a failed add.
+        // Elements with an add that did not fail.
         let mut attempted: HashSet<T> = HashSet::new();
-        let mut failed: HashSet<T> = HashSet::new();
 
         for (pos, op) in history.ops().iter().enumerate() {
             match op.f {
@@ -350,10 +350,7 @@ impl SetFullChecker {
                                     state.on_add_ok(op);
                                 }
                             }
-                            OpType::Fail => {
-                                failed.insert(v.clone());
-                            }
-                            OpType::Info => {}
+                            OpType::Fail | OpType::Info => {}
                         }
                     }
                 }
@@ -413,13 +410,12 @@ impl SetFullChecker {
             }
         }
 
-        let mut observed_failed: Vec<T> = failed
-            .into_iter()
-            .filter(|e| {
-                !attempted.contains(e) && elements.get(e).is_some_and(|s| s.last_present.is_some())
-            })
+        let mut observed_without_add: Vec<T> = elements
+            .values()
+            .filter(|s| s.last_present.is_some() && !attempted.contains(&s.element))
+            .map(|s| s.element.clone())
             .collect();
-        observed_failed.sort();
+        observed_without_add.sort();
 
         let mut results: Vec<ElementResult<T>> = elements
             .into_values()
@@ -497,7 +493,7 @@ impl SetFullChecker {
 
         let valid = if !lost.is_empty()
             || !duplicates.is_empty()
-            || !observed_failed.is_empty()
+            || !observed_without_add.is_empty()
             || linearizability_violation.is_some()
         {
             Validity::Invalid
@@ -520,7 +516,7 @@ impl SetFullChecker {
             stale,
             worst_stale,
             duplicated: duplicates,
-            observed_failed,
+            observed_without_add,
             linearizability_violation,
             stable_latencies,
             lost_latencies,
@@ -998,64 +994,6 @@ mod tests {
         assert_eq!(result.worst_stale[1].stable_latency_ms, 3);
         assert_eq!(result.worst_stale[2].element, 2);
         assert_eq!(result.worst_stale[2].stable_latency_ms, 1);
-    }
-
-    #[test]
-    fn test_element_discovered_in_read() {
-        // Element appears in a read without any prior add operation.
-        // This can happen if the history is incomplete or if element was added
-        // by a process not in the history.
-        let mut history = History::new();
-
-        // Read sees element 42, but there's no add for it
-        history
-            .push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)))
-            .unwrap();
-        history
-            .push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)))
-            .unwrap();
-
-        // Second read also sees it
-        history
-            .push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)))
-            .unwrap();
-        history
-            .push(Op::read_ok(3, 0u64, [42]).at(Timestamp::from_millis(3)))
-            .unwrap();
-
-        let result = SetFullChecker::default().check(&history);
-
-        // Element should be tracked and stable (seen in both reads)
-        assert_eq!(result.attempt_count, 1);
-        assert_eq!(result.stable_count, 1);
-        assert_eq!(result.valid, Validity::Valid);
-    }
-
-    #[test]
-    fn test_element_discovered_in_read_then_lost() {
-        // Element appears in read, then disappears - should be lost
-        let mut history = History::new();
-
-        history
-            .push(Op::read_invoke(0, 0u64).at(Timestamp::from_millis(0)))
-            .unwrap();
-        history
-            .push(Op::read_ok(1, 0u64, [42]).at(Timestamp::from_millis(1)))
-            .unwrap();
-
-        history
-            .push(Op::read_invoke(2, 0u64).at(Timestamp::from_millis(2)))
-            .unwrap();
-        history
-            .push(Op::read_ok(3, 0u64, []).at(Timestamp::from_millis(3)))
-            .unwrap();
-
-        let result = SetFullChecker::default().check(&history);
-
-        assert_eq!(result.attempt_count, 1);
-        assert_eq!(result.lost_count, 1);
-        assert!(result.lost.contains(&42));
-        assert_eq!(result.valid, Validity::Invalid);
     }
 
     // ====== Bug fix regression tests ======
@@ -1642,17 +1580,35 @@ mod tests {
         }
     }
 
+    /// A read returning an element that nothing in the history could have added
+    /// is invalid in both modes, even if every read agrees on it.
     #[test]
-    fn test_observed_failed_add_invalid() {
-        let mut history = History::new();
-        history.push(Op::add_invoke(0, 0u64, 1)).unwrap();
-        history.push(Op::add_fail(1, 0u64, 1)).unwrap();
-        history.push(Op::read_invoke(2, 1u64)).unwrap();
-        history.push(Op::read_ok(3, 1u64, [1])).unwrap();
-
-        let result = SetFullChecker::default().check(&history);
-        assert_eq!(result.valid, Validity::Invalid);
-        assert_eq!(result.observed_failed, vec![1]);
+    fn test_observed_without_add_invalid() {
+        let cases: [(&str, Vec<Op<i32>>); 3] = [
+            (
+                "only add failed",
+                vec![Op::add_invoke(0, 0u64, 1), Op::add_fail(1, 0u64, 1)],
+            ),
+            ("never added", vec![]),
+            (
+                "only a different element added",
+                vec![Op::add_invoke(0, 0u64, 2), Op::add_ok(1, 0u64, 2)],
+            ),
+        ];
+        for (name, adds) in cases {
+            let reads = [
+                Op::read_invoke(10, 1u64),
+                Op::read_ok(11, 1u64, [1]),
+                Op::read_invoke(12, 1u64),
+                Op::read_ok(13, 1u64, [1]),
+            ];
+            let history = History::from_ops(adds.into_iter().chain(reads)).unwrap();
+            for checker in [SetFullChecker::default(), SetFullChecker::linearizable()] {
+                let result = checker.check(&history);
+                assert_eq!(result.valid, Validity::Invalid, "{name}");
+                assert_eq!(result.observed_without_add, vec![1], "{name}");
+            }
+        }
     }
 
     mod property_tests {

@@ -56,11 +56,13 @@ The **set-full checker** tracks elements through add and read operations:
 
 - **Stable**: Element is visible in all reads after being added
 - **Lost**: Element was confirmed added but later disappeared
-- **Stale**: Element took multiple reads to become visible (non-linearizable)
+- **Stale**: Element took multiple reads to become visible
 - **Never-read**: Element was added but no subsequent reads occurred
 
-A history is **valid** if no elements are lost, no read returns duplicates, and no read
-returns an element whose every add failed.
+A history is **valid** if no elements are lost, no read returns duplicates, and every
+element a read returns has an add in the history that did not fail. The history must
+be complete: an element added by a process outside it is reported in
+`observed_without_add`.
 
 ## Linearizable mode
 
