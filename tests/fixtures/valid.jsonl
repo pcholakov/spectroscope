@@ -1,0 +1,4 @@
+{"index":0,"process":0,"type":"invoke","time_ms":0,"ops":[["append","x",1],["r","y",null]]}
+{"index":1,"process":0,"type":"ok","time_ms":1,"ops":[["append","x",1],["r","y",[]]]}
+{"index":2,"process":1,"type":"invoke","time_ms":2,"ops":[["r","x",null]]}
+{"index":3,"process":1,"type":"ok","time_ms":3,"ops":[["r","x",[1]]]}

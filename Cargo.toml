@@ -14,6 +14,17 @@ categories = ["development-tools::testing"]
 [dependencies]
 ahash = "0.8"
 
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# Builds the `check-list-append` command-line checker.
+cli = ["dep:serde", "dep:serde_json"]
+
+[[bin]]
+name = "check-list-append"
+required-features = ["cli"]
+
 [dev-dependencies]
 proptest = "1.5"
 rand = "0.9"

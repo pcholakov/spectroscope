@@ -133,6 +133,15 @@ assert_eq!(result.valid, Validity::Invalid);
 assert_eq!(result.anomalies[0].name(), "duplicate-elements");
 ```
 
+### Command line
+
+`cargo run --features cli --bin check-list-append -- [--model serializable|strong-session-serializable|strict-serializable] [--json] history.jsonl`
+checks a JSONL history (`-` reads stdin). Each line is one op:
+`{"index": 0, "process": 0, "type": "invoke", "time_ms": 0, "ops": [["append", "x", 1], ["r", "y", null]]}`,
+where `type` is `invoke`, `ok`, `fail` or `info`, and an `ok` completion carries each read's list.
+The default model is `strict-serializable`. The exit code is 0 for valid, 1 for invalid, and 2 for
+unknown, unreadable or malformed input.
+
 ### Validation
 
 `tests/list_append_oracle.rs` compares the checker's verdict for each model with a
