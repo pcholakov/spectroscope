@@ -1,0 +1,8 @@
+{"index":0,"process":0,"type":"invoke","time_ms":0,"ops":[["append","x",1]]}
+{"index":1,"process":0,"type":"ok","time_ms":1,"ops":[["append","x",1]]}
+{"index":2,"process":1,"type":"invoke","time_ms":2,"ops":[["append","x",2]]}
+{"index":3,"process":2,"type":"invoke","time_ms":3,"ops":[["append","x",3]]}
+{"index":4,"process":2,"type":"fail","time_ms":4,"ops":[["append","x",3]]}
+{"index":5,"process":1,"type":"info","time_ms":5,"ops":[["append","x",2]]}
+{"index":6,"process":3,"type":"invoke","time_ms":6,"ops":[["r","x",null]]}
+{"index":7,"process":3,"type":"ok","time_ms":7,"ops":[["r","x",[1,2]]]}

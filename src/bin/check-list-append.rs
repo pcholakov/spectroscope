@@ -10,7 +10,8 @@
 //! `type` is `invoke`, `ok`, `fail` or `info`; a read is `["r", key, null]` in an
 //! invocation and `["r", key, [values...]]` in an `ok` completion.
 //!
-//! Exit code 0: valid. 1: invalid. 2: unknown, unreadable or malformed input.
+//! Exit code 0: valid. 1: invalid. 2: unknown, unreadable or malformed input, or a history with no
+//! `ok` operation (a checker that saw nothing proves nothing).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -101,10 +102,15 @@ fn run() -> Result<ExitCode, String> {
     let history = parse_history(&input)?;
     let result = ListAppendChecker::new(args.model).check(&history);
     let report = Report::new(&history, &result);
+    let has_ok_ops = history.ops().iter().any(|op| op.op_type == OpType::Ok);
     if args.json {
         println!("{:#}", report.to_json(args.model));
     } else {
         report.print(args.model);
+    }
+    if !has_ok_ops {
+        eprintln!("error: the history has no ok operation, so it proves nothing");
+        return Ok(ExitCode::from(2));
     }
     Ok(match result.valid {
         Validity::Valid => ExitCode::SUCCESS,

@@ -1,0 +1,4 @@
+{"index":0,"process":0,"type":"invoke","time_ms":0,"ops":[["append","x",1]]}
+{"index":1,"process":0,"type":"fail","time_ms":1,"ops":[["append","x",1]]}
+{"index":2,"process":1,"type":"invoke","time_ms":2,"ops":[["append","x",2]]}
+{"index":3,"process":1,"type":"info","time_ms":3,"ops":[["append","x",2]]}

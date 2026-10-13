@@ -47,3 +47,18 @@ fn malformed_history_exits_two() {
     let (code, _) = run("malformed.jsonl", &[]);
     assert_eq!(code, 2);
 }
+
+#[test]
+fn info_and_fail_ops_are_accepted() {
+    let (code, stdout) = run("info_and_fail.jsonl", &[]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("ok=2 fail=1 info=1"), "{stdout}");
+}
+
+#[test]
+fn history_without_ok_ops_exits_two() {
+    for fixture in ["no_ok.jsonl", "empty.jsonl"] {
+        let (code, stdout) = run(fixture, &[]);
+        assert_eq!(code, 2, "{fixture}: {stdout}");
+    }
+}
